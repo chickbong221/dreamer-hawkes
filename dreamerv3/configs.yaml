@@ -265,7 +265,7 @@ maniskill_rgb:
   env:
     maniskill:
       use_seed: true
-      num_envs: 128
+      num_envs: 64
       obs_mode: rgb
       sim_backend: gpu
       image_size: 128
@@ -273,6 +273,6 @@ maniskill_rgb:
       num_frames: 1          # no frame stacking → 3 channels input to CNN
 
 mshab:
-  batch_size: 16
+  batch_size: 8
   run:
-    steps: 20e6
+    steps: 10e6
