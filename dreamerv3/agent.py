@@ -43,6 +43,7 @@ class Agent(embodied.jax.Agent):
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
     self.dyn = {
         'rssm': rssm.RSSM,
+        'hawkes': hawkes_rssm.HawkesRSSM,
     }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
         'simple': rssm.Decoder,
@@ -163,8 +164,25 @@ class Agent(embodied.jax.Agent):
     # World model
     enc_carry, enc_entries, tokens = self.enc(
         enc_carry, obs, reset, training)
+
+    # dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
+    #     dyn_carry, tokens, prevact, reset, training)
+
+    # Build kwargs for the dynamics loss. Only the Hawkes dynamics consumes
+    # privileged event labels; the stock RSSM path is left exactly as upstream.
+    loss_kwargs = {}
+    if self.config.dyn.typ == 'hawkes':
+      extras = {}
+      if 'log/success_once' in data and 'log/fail_once' in data:
+        succ = data['log/success_once'].astype('int32')
+        fail = data['log/fail_once'].astype('int32')
+        # 0 = idle, 1 = success, 2 = fail
+        extras['event_label'] = succ + 2 * (fail * (1 - succ))
+      loss_kwargs['extras'] = extras
+
     dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
-        dyn_carry, tokens, prevact, reset, training)
+      dyn_carry, tokens, prevact, reset, training=training, **loss_kwargs)
+
     losses.update(los)
     metrics.update(mets)
     dec_carry, dec_entries, recons = self.dec(
