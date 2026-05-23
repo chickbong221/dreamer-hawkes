@@ -174,9 +174,9 @@ class Agent(embodied.jax.Agent):
     loss_kwargs = {}
     if self.config.dyn.typ == 'hawkes':
       extras = {}
-      if 'log/success_once' in data and 'log/fail_once' in data:
-        succ = data['log/success_once'].astype('int32')
-        fail = data['log/fail_once'].astype('int32')
+      if 'log/success_once' in obs and 'log/fail_once' in obs:
+        succ = obs['log/success_once'].astype('int32')
+        fail = obs['log/fail_once'].astype('int32')
         # 0 = idle, 1 = success, 2 = fail
         extras['event_label'] = succ + 2 * (fail * (1 - succ))
       loss_kwargs['extras'] = extras
