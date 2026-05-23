@@ -313,4 +313,5 @@ def make_stream(config, replay, mode):
 
 
 if __name__ == '__main__':
+  print("Using Hawkes")
   main()
