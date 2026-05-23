@@ -133,11 +133,11 @@ class HawkesRSSM(nj.Module):
                         nj.Variable, jnp.zeros, (K, K), f32).read()
     beta_raw = self.sub('haw_beta_raw',
                         nj.Variable, jnp.zeros, (K, K), f32).read()
-    mu    = jax.nn.softplus(mu_raw   + self.haw_init_mu)         # [K]
-    beta  = jax.nn.softplus(beta_raw + self.haw_init_beta)        # [K, K]
+    mu    = jax.nn.softplus(mu_raw   + self.haw_init_mu).astype(nn.COMPUTE_DTYPE)   # [K]
+    beta  = jax.nn.softplus(beta_raw + self.haw_init_beta).astype(nn.COMPUTE_DTYPE) # [K, K]
     # alpha starts near zero so the model begins close to plain RSSM and
     # learns excitation/inhibition entries as needed.
-    return mu, alpha, beta
+    return mu, alpha.astype(nn.COMPUTE_DTYPE), beta
 
   def _event_prior(self, deter, action):
     """Causal prior p_t^pri(e_t | z_t, a_t). Returns logits [B, K]."""
