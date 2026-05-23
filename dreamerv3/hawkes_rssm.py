@@ -262,7 +262,7 @@ class HawkesRSSM(nj.Module):
     # posterior (which saw the new observation). High KL = the observation
     # carried information the dynamics could not predict — i.e. an event.
     prior_logit = sg(self._prior(deter))
-    eps = self._dist(logit).kl(self._dist(prior_logit))[..., None]  # [B, 1]
+    eps = self._dist(logit).kl(self._dist(prior_logit))[..., None].astype(nn.COMPUTE_DTYPE)  # [B, 1]
     post_logit = self._event_post(deter, tokens_flat, action, eps)
     post_probs = jax.nn.softmax(post_logit, axis=-1)
     haw_prev_next = post_probs
