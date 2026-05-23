@@ -385,6 +385,8 @@ class HawkesRSSM(nj.Module):
       losses['haw_sup'] = -(one_hot * post_lp).sum(-1)
       metrics['haw_sup_acc'] = (
           post_p.argmax(-1) == labels).mean().astype(f32)
+    else:
+      losses['haw_sup'] = jnp.zeros_like(losses['haw'])
 
     # Metrics
     metrics['haw_lam_mean'] = lam.mean()
