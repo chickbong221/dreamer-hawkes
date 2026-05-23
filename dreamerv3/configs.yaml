@@ -528,17 +528,17 @@ maniskill_rgb:
     envs: 1
     eval_envs: 4
     eval_eps: 1
-    eval_freq: 50000
-    train_ratio: 128.0   # lower than state: CNN encoder adds cost per update
-    steps: 4e6
-    log_every: 120
-    save_every: 600
-    report_every: 300
-  batch_size: 8        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
+    eval_freq: 100000
+    train_ratio: 256.0   # lower than state: CNN encoder adds cost per update
+    steps: 2e6
+    log_every: 1500
+    save_every: 100000
+    report_every: 10000
+  batch_size: 16        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
   batch_length: 64
   replay_context: 1
   replay:
-    size: 200000        # TD-MPC2 rgb: buffer_size=100_000 (pixels expensive)
+    size: 450000        # TD-MPC2 rgb: buffer_size=100_000 (pixels expensive)
     online: true
     fracs: {uniform: 1.0, priority: 0.0, recency: 0.0}
   jax:
@@ -552,7 +552,7 @@ maniskill_rgb:
   env:
     maniskill:
       use_seed: true
-      num_envs: 128
+      num_envs: 189
       obs_mode: rgb
       sim_backend: gpu
       image_size: 128
@@ -560,7 +560,7 @@ maniskill_rgb:
       num_frames: 1          # no frame stacking → 3 channels input to CNN
 
 mshab:
-  batch_size: 16
+  batch_size: 32
   run:
     steps: 10e6
 

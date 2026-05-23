@@ -45,6 +45,9 @@ python -m dreamerv3.main \
 
 python -m dreamerv3.main \
   --configs maniskill_rgb size100m mshab \
+  -  --env.maniskill.control_mode pd_joint_
+python -m dreamerv3.main \
+  --configs maniskill_rgb size100m mshab \
   --task maniskill_PickSubtaskTrain-v0 \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task tidy_house \
