@@ -278,7 +278,7 @@
 
 defaults:
 
-  logdir: ~/logdir/{timestamp}
+  logdir: /mnt/data/tuannl/logdir/{timestamp}
   replica: 0
   replicas: 1
   method: name
