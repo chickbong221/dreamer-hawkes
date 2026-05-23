@@ -272,7 +272,7 @@ class HawkesRSSM(nj.Module):
         haw_state=haw_state, haw_prev=haw_prev_next)
     feat = dict(
         deter=deter, stoch=stoch, logit=logit,
-        haw_lam=lam, haw_post=post_logit, haw_embed=h_haw)
+        haw_lam=lam, haw_logit=post_logit, haw_embed=h_haw)
     entry = dict(
         deter=deter, stoch=stoch,
         haw_state=haw_state, haw_prev=haw_prev_next)
@@ -304,7 +304,7 @@ class HawkesRSSM(nj.Module):
           haw_state=haw_state, haw_prev=pri_probs))
       feat = nn.cast(dict(
           deter=deter, stoch=stoch, logit=logit,
-          haw_lam=lam, haw_pri=pri_logit, haw_embed=h_haw))
+          haw_lam=lam, haw_logit=pri_logit, haw_embed=h_haw))
       return carry, (feat, action)
     else:
       unroll = length if self.unroll else 1
@@ -344,7 +344,7 @@ class HawkesRSSM(nj.Module):
     # produce the posterior, so the KL is well-defined per step.
     actemb = nn.DictConcat(self.act_space, 1)(acts)
     pri_logit = self._event_prior(feat['deter'], actemb)
-    post_logit = feat['haw_post']
+    post_logit = feat['haw_logit']
     lam = feat['haw_lam']                                  # [B, T, K]
 
     # Sample e_t differentiably from the posterior
