@@ -49,6 +49,7 @@ defaults:
       num_frames: 1
       mshab_task: 'none'
       mshab_split: train
+      mshab_obj: all
 
   replay:
     size: 5e6
