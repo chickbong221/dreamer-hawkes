@@ -252,7 +252,7 @@ maniskill_rgb:
     eval_envs: 4
     eval_eps: 1
     eval_freq: 100000
-    train_ratio: 128.0   # lower than state: CNN encoder adds cost per update
+    train_ratio: 256.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
     save_every: 100000
@@ -283,7 +283,7 @@ maniskill_rgb:
       num_frames: 1          # no frame stacking → 3 channels input to CNN
 
 mshab:
-  batch_size: 16
+  batch_size: 32
   run:
     steps: 10e6
 

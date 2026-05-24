@@ -6,7 +6,6 @@ from functools import partial as bind
 
 # Must be set before JAX initialises to share GPU with ManiSkill cleanly.
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
-os.environ.setdefault('XLA_PYTHON_CLIENT_MEM_FRACTION', '0.4')
 
 folder = pathlib.Path(__file__).parent
 sys.path.insert(0, str(folder.parent))
