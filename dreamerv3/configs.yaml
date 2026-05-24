@@ -252,7 +252,7 @@ maniskill_rgb:
     eval_envs: 4
     eval_eps: 1
     eval_freq: 100000
-    train_ratio: 256.0   # lower than state: CNN encoder adds cost per update
+    train_ratio: 128.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
     save_every: 100000
@@ -267,7 +267,7 @@ maniskill_rgb:
   jax:
     prealloc: false     # critical: ManiSkill and JAX share GPU
   logger:
-    outputs: [jsonl, wandb]
+    outputs: [wandb]
     wandb_project: maniskill
     wandb_entity: letuanhf-hanoi-university-of-science-and-technology        # set via --set logger.wandb_entity=your-entity
     wandb_group: na
@@ -283,7 +283,7 @@ maniskill_rgb:
       num_frames: 1          # no frame stacking → 3 channels input to CNN
 
 mshab:
-  batch_size: 24
+  batch_size: 16
   run:
     steps: 10e6
 
