@@ -400,7 +400,27 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       for _ in range(args.consec_report * args.report_batches):
         carry_report, mets = agent.report(carry_report, next(stream_report))
         agg.add(mets)
-      logger.add(agg.result(), prefix='report')
+      report_mets = agg.result()
+      video_mets = {
+          k: v for k, v in report_mets.items()
+          if isinstance(v, np.ndarray) and v.ndim == 4 and v.dtype == np.uint8}
+      scalar_mets = {k: v for k, v in report_mets.items() if k not in video_mets}
+      logger.add(scalar_mets, prefix='report')
+      if video_mets:
+        try:
+          import wandb
+          if wandb.run is not None:
+            _flush_logger_before_direct_wandb()
+            payload = {}
+            for k, v in video_mets.items():
+              # v shape: [T, H, W, C] uint8 — wandb.Video expects [T, C, H, W]
+              payload[f'report/{k}'] = wandb.Video(
+                  v.transpose(0, 3, 1, 2),
+                  fps=int(_arg('report_fps', 4)),
+                  format='mp4')
+            _wandb_log_direct(payload, step)
+        except Exception as exc:
+          print(f'Could not log report videos to W&B as mp4: {exc}')
 
     if should_log(step):
       logger.add(train_agg.result())
