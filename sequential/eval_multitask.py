@@ -31,7 +31,6 @@ from functools import partial as bind
 
 # Must be set before JAX initialises — same as dreamerv3/main.py.
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
-os.environ.setdefault('XLA_PYTHON_CLIENT_MEM_FRACTION', '0.4')
 
 # sequential/ lives one level below the repo root.
 REPO = pathlib.Path(__file__).parent.parent
