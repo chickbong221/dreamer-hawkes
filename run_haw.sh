@@ -5,13 +5,16 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=0
-#SBATCH --output=/home/tuannl/mnt_data/output/%x_%j.out
-#SBATCH --error=/home/tuannl/mnt_data/output/%x_%j.err
+#SBATCH --output=/home/%u/mnt_data/output/%x_%j.out
+#SBATCH --error=/home/%u/mnt_data/output/%x_%j.err
+
+USERNAME=$USER
 
 echo "================================="
 echo "Job started on $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
 echo "GPUs allocated: $CUDA_VISIBLE_DEVICES"
+echo "Username: $USERNAME"
 echo "================================="
 
 # Activate conda
@@ -40,22 +43,21 @@ export LD_LIBRARY_PATH=$NVIDIA_USERSPACE_DIR:${LD_LIBRARY_PATH:-}
 export VK_DRIVER_FILES=$NVIDIA_USERSPACE_DIR/nvidia_icd_egl.json
 export VK_ICD_FILENAMES=$NVIDIA_USERSPACE_DIR/nvidia_icd_egl.json
 
-vulkaninfo --summary 
+vulkaninfo --summary
 
 # Move to project directory
-cd /home/tuannl/projects/dreamer-maniskill-hab
+cd /home/$USERNAME/projects/dreamer-maniskill-hab
 
 export WANDB_API_KEY="b1d6eed8871c7668a889ae74a621b5dbd2f3b070"
-export MS_ASSET_DIR=/mnt/data/tuannl
+export MS_ASSET_DIR=$HOME/mnt_data
 
 # Print initial GPU state
 nvidia-smi
 
 # Monitor GPU every 20 seconds in background
-nvidia-smi -l 100 > /home/tuannl/mnt_data/output/gpu_${SLURM_JOB_ID}.log &
+nvidia-smi -l 100 > $HOME/mnt_data/output/gpu_${SLURM_JOB_ID}.log &
 GPU_MONITOR_PID=$!
 
-# Generate timestamp properly
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 unset XLA_PYTHON_CLIENT_MEM_FRACTION
