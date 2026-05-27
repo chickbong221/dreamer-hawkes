@@ -255,8 +255,8 @@ maniskill_rgb:
     train_ratio: 256.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
-    save_every: 100000
-    report_every: 10000
+    save_every: 5000000
+    report_every: 500000
   batch_size: 16        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
   batch_length: 64
   replay_context: 1
