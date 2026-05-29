@@ -89,6 +89,16 @@ pip install -e "$REPO_ROOT"
 # CloseSubtaskTrain-v0, NavigateSubtaskTrain-v0, and SequentialTask-v0.
 pip install -e "$REPO_ROOT/mshab"
 
+# ── 10. Fix OpenCV (headless server compatibility) ───────────────────────────
+# ManiSkill pulls in opencv-python which conflicts with headless rendering.
+# Replace all opencv variants with the headless build.
+python -m pip uninstall -y \
+  opencv-python \
+  opencv-contrib-python \
+  opencv-python-headless \
+  opencv-contrib-python-headless
+python -m pip install --no-cache-dir opencv-python-headless
+
 echo ""
 echo ">>> Installation complete."
 echo "    Next steps for ManiSkill-HAB tasks: download assets (see README.md)."

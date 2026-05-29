@@ -71,6 +71,7 @@ defaults:
     eval_envs: 4
     eval_eps: 1
     eval_freq: 50000
+    eval_video_freq: 0
     report_batches: 1
     from_checkpoint: ''
     episode_timeout: 180
@@ -246,18 +247,19 @@ debug:
     .*\.depth: 2
 
 maniskill_rgb:
-  <<: *size25m
+  <<: *size100m
   run:
     envs: 1
     eval_envs: 4
     eval_eps: 1
-    eval_freq: 100000
+    eval_freq: 20000
+    eval_video_freq: 1000000
     train_ratio: 256.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
-    save_every: 5000000
+    save_every: 500000
     report_every: 500000
-  batch_size: 16        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
+  batch_size: 32        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
   batch_length: 64
   replay_context: 1
   replay:
@@ -283,9 +285,40 @@ maniskill_rgb:
       num_frames: 1          # no frame stacking → 3 channels input to CNN
 
 mshab:
+  <<: *size200m
   batch_size: 32
   run:
     steps: 10e6
+
+behavior1k:
+  <<: *size100m
+  task: behavior1k_picking_up_trash
+  jax:
+    prealloc: false       # Isaac Sim and JAX share the GPU
+  logger:
+    outputs: [wandb]
+    wandb_project: behavior1k
+    wandb_entity: letuanhf-hanoi-university-of-science-and-technology
+    wandb_group: na
+  run:
+    envs: 1               # OmniGibson is not vectorized
+    eval_envs: 1
+    steps: 5e6
+    train_ratio: 128       # OmniGibson is slow (~5-20 FPS); compensate with more updates
+    log_every: 300
+    save_every: 3600
+    report_every: 1800
+  batch_size: 32
+  batch_length: 64
+  replay_context: 1
+  replay:
+    size: 100000
+    online: true
+  env:
+    behavior1k:
+      image_size: 128
+      activity_definition_id: 0
+      activity_instance_id: 0
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Hawkes presets — flip dyn.typ to use HawkesRSSM.

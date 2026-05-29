@@ -31,7 +31,8 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   start_time = time()
   train_vector_episode_done = [False]
   train_episode_idx = [0]
-  eval_next = [True]
+  eval_stat_next = [True]
+  eval_video_next = [False]
 
   def _arg(name, default):
     if hasattr(args, 'get'):
@@ -41,6 +42,7 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   # TD-MPC2 defaults: num_eval_envs=4, eval_episodes_per_env=2.
   # For your requested setup, keep eval_eps=1 and set eval_envs=4.
   eval_freq = int(float(_arg('eval_freq', 50000)))
+  eval_video_freq = int(float(_arg('eval_video_freq', 0)))
   eval_num_envs = int(_arg('eval_envs', 4))
   eval_episodes_per_env = int(_arg('eval_eps', 1))
   assert eval_episodes_per_env == 1, (
@@ -244,7 +246,7 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     return out
 
   @elements.timer.section('evalfn')
-  def evalfn():
+  def evalfn(do_video=False):
     if eval_env is None:
       return
 
@@ -268,9 +270,7 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
         obs = eval_env.step(acts)
         obs = {k: np.asarray(v) for k, v in obs.items()}
 
-        # TD-MPC2's eval env records videos from the separate eval environment.
-        # Here we capture those eval frames directly and log videos/eval_video.
-        if hasattr(eval_env, 'render'):
+        if do_video and hasattr(eval_env, 'render'):
           try:
             video_frames.append(eval_env.render())
           except Exception as exc:
@@ -331,15 +331,15 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     # W&B step=d['step']. Do this directly to W&B as requested.
     _wandb_log_direct({f'eval/{k}': v for k, v in eval_metrics.items()}, step)
 
-    # TD-MPC2 immediately follows scalar eval logging with:
-    #   logger.log_wandb_video(self._step)
-    _log_wandb_eval_video(video_frames, step, fps=15,
-                          key='videos/eval_video')
+    if do_video:
+      _log_wandb_eval_video(video_frames, step, fps=15,
+                            key='videos/eval_video')
 
     shown = ', '.join(
         f'{k}: {v:.4g}' for k, v in eval_metrics.items()
         if isinstance(v, (int, float, np.integer, np.floating)))
-    print(f'Eval metrics | {shown}')
+    suffix = ' [+video]' if do_video else ''
+    print(f'Eval metrics{suffix} | {shown}')
 
   stream_train = iter(agent.stream(make_stream(replay, 'train')))
   stream_report = iter(agent.stream(make_stream(replay, 'report')))
@@ -373,24 +373,27 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   policy = lambda *xs: agent.policy(*xs, mode='train')
   driver.reset(agent.init_policy)
 
-  # TD-MPC2 evaluates once at step 0 before the first train rollout.
-  if eval_env is not None and eval_next[0]:
-    evalfn()
-    eval_next[0] = False
+  # evaluate once at step 0 before the first train rollout
+  if eval_env is not None and eval_stat_next[0]:
+    do_video = eval_video_freq > 0
+    eval_video_next[0] = False
+    evalfn(do_video=do_video)
+    eval_stat_next[0] = False
 
   while step < args.steps:
 
     train_vector_episode_done[0] = False
     driver(policy, steps=10)
 
-    # TD-MPC2 sets eval_next when entering the eval_freq window, then runs eval
-    # only when the current training vector episode has completed.
     if eval_env is not None and eval_freq > 0:
       if int(step) > 0 and int(step) % eval_freq < driver.length:
-        eval_next[0] = True
-      if train_vector_episode_done[0] and eval_next[0]:
-        evalfn()
-        eval_next[0] = False
+        eval_stat_next[0] = True
+      if eval_video_freq > 0 and int(step) > 0 and int(step) % eval_video_freq < driver.length:
+        eval_video_next[0] = True
+      if train_vector_episode_done[0] and eval_stat_next[0]:
+        evalfn(do_video=eval_video_next[0])
+        eval_stat_next[0] = False
+        eval_video_next[0] = False
 
     if train_vector_episode_done[0]:
       train_episode_idx[0] += 1

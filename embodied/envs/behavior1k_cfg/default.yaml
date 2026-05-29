@@ -1,0 +1,52 @@
+env:
+  device: null
+  automatic_reset: false
+  flatten_action_space: true
+  flatten_obs_space: true
+  external_sensors: null
+  action_frequency: 10
+  rendering_frequency: 10
+  physics_frequency: 120
+
+render:
+  viewer_width: 128
+  viewer_height: 128
+
+scene:
+  type: InteractiveTraversableScene
+  scene_model: house_double_floor_lower
+  trav_map_resolution: 0.1
+  default_erosion_radius: 0.0
+  trav_map_with_objects: true
+  num_waypoints: 1
+  waypoint_resolution: 0.2
+  load_room_types: null
+  load_room_instances: null
+  scene_source: OG
+  include_robots: true
+
+robots:
+  - model: fetch
+    obs_modalities: [rgb, proprio]
+    action_normalize: true
+    action_type: continuous
+    grasping_mode: physical
+    sensor_config:
+      VisionSensor:
+        sensor_kwargs:
+          image_height: 64
+          image_width: 64
+
+objects: []
+
+task:
+  type: BehaviorTask
+  activity_name: picking_up_trash
+  activity_definition_id: 0
+  activity_instance_id: 0
+  online_object_sampling: false
+  use_presampled_robot_pose: true
+  termination_config:
+    max_steps: 500
+  reward_config:
+    r_potential: 1.0

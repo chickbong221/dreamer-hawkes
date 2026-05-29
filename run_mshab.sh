@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dreamerv3-ms
+#SBATCH --job-name=dreamerv3-mshab
 #SBATCH --partition=main
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -8,13 +8,10 @@
 #SBATCH --output=/home/%u/mnt_data/output/%x_%j.out
 #SBATCH --error=/home/%u/mnt_data/output/%x_%j.err
 
-USERNAME=$USER
-
 echo "================================="
 echo "Job started on $(hostname)"
 echo "Job ID: $SLURM_JOB_ID"
 echo "GPUs allocated: $CUDA_VISIBLE_DEVICES"
-echo "Username: $USERNAME"
 echo "================================="
 
 # Activate conda
@@ -49,86 +46,87 @@ vulkaninfo --summary
 cd /home/$USERNAME/projects/dreamer-maniskill-hab
 
 export WANDB_API_KEY="b1d6eed8871c7668a889ae74a621b5dbd2f3b070"
-export MS_ASSET_DIR=$HOME/mnt_data
+export MS_ASSET_DIR=/mnt/data/$USERNAME
 
 # Print initial GPU state
 nvidia-smi
 
 # Monitor GPU every 20 seconds in background
-nvidia-smi -l 100 > $HOME/mnt_data/output/gpu_${SLURM_JOB_ID}.log &
+nvidia-smi -l 100 > /home/$USERNAME/mnt_data/output/gpu_${SLURM_JOB_ID}.log &
 GPU_MONITOR_PID=$!
 
+# Generate timestamp properly
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 unset XLA_PYTHON_CLIENT_MEM_FRACTION
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb size200m mshab hawkes \
-  --logdir /mnt/data/$USERNAME/logdir/{timestamp} \
+  --configs maniskill_rgb mshab \
   --task maniskill_PlaceSubtaskTrain-v0 \
+  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
-  --logger.wandb_name hawkes-dreamerv3-mshab-place-set-table-200m
+  --logger.wandb_name dreamerv3-mshab-place-set-table
 
 # python -m dreamerv3.main \
-#   --configs maniskill_rgb size100m mshab hawkes \
-#   --logdir /mnt/data/$USERNAME/logdir/{timestamp} \
+#   --configs maniskill_rgb mshab \
 #   --task maniskill_OpenSubtaskTrain-v0 \
+#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --env.maniskill.mshab_obj kitchen_counter \
-#   --logger.wandb_name hawkes-dreamerv3-mshab-open-set-table-kitchen-counter
+#   --logger.wandb_name dreamerv3-mshab-open-set-table-kitchen-counter
 
 # python -m dreamerv3.main \
-#   --configs maniskill_rgb size100m mshab hawkes \
-#   --logdir /mnt/data/$USERNAME/logdir/{timestamp} \
+#   --configs maniskill_rgb mshab \
 #   --task maniskill_OpenSubtaskTrain-v0 \
+#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --env.maniskill.mshab_obj fridge \
-#   --logger.wandb_name hawkes-dreamerv3-mshab-open-set-table-fridge
+#   --logger.wandb_name dreamerv3-mshab-open-set-table-fridge
 
 # python -m dreamerv3.main \
-#   --configs maniskill_rgb size100m mshab hawkes \
-#   --logdir /mnt/data/$USERNAME/logdir/{timestamp} \
+#   --configs maniskill_rgb mshab \
 #   --task maniskill_CloseSubtaskTrain-v0 \
+#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --env.maniskill.mshab_obj kitchen_counter \
-#   --logger.wandb_name hawkes-dreamerv3-mshab-close-set-table-kitchen-counter
+#   --logger.wandb_name dreamerv3-mshab-close-set-table-kitchen-counter
 
 # python -m dreamerv3.main \
-#   --configs maniskill_rgb size100m mshab hawkes \
-#   --logdir /mnt/data/$USERNAME/logdir/{timestamp} \
+#   --configs maniskill_rgb mshab \
 #   --task maniskill_CloseSubtaskTrain-v0 \
+#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --env.maniskill.mshab_obj fridge \
-#   --logger.wandb_name hawkes-dreamerv3-mshab-close-set-table-fridge
+#   --logger.wandb_name dreamerv3-mshab-close-set-table-fridge
 
 # python -m dreamerv3.main \
-#   --configs maniskill_rgb size100m mshab hawkes \
-#   --logdir /mnt/data/$USERNAME/logdir/{timestamp} \
+#   --configs maniskill_rgb mshab \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
+#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task tidy_house \
-#   --logger.wandb_name hawkes-dreamerv3-mshab-navigate-tidy-house
+#   --logger.wandb_name dreamerv3-mshab-navigate-tidy-house
 
 # python -m dreamerv3.main \
-#   --configs maniskill_rgb size100m mshab hawkes \
-#   --logdir /mnt/data/$USERNAME/logdir/{timestamp} \
+#   --configs maniskill_rgb mshab \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
+#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task prepare_groceries \
-#   --logger.wandb_name hawkes-dreamerv3-mshab-navigate-prepare-groceries
+#   --logger.wandb_name dreamerv3-mshab-navigate-prepare-groceries
 
 # python -m dreamerv3.main \
-#   --configs maniskill_rgb size100m mshab hawkes \
-#   --logdir /mnt/data/$USERNAME/logdir/{timestamp} \
+#   --configs maniskill_rgb mshab \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
+#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
-#   --logger.wandb_name hawkes-dreamerv3-mshab-navigate-set-table
+#   --logger.wandb_name dreamerv3-mshab-navigate-set-table
 
 # Stop GPU monitor
 kill $GPU_MONITOR_PID

@@ -69,6 +69,21 @@ def main(argv=None):
 
   suite = config.task.split('_', 1)[0]
 
+  if suite == 'behavior1k':
+    args = args.update(envs=1, eval_envs=1, debug=False)
+    if config.script == 'train':
+      embodied.run.train(
+          bind(make_agent, config),
+          bind(make_replay, config, 'replay'),
+          bind(make_env, config),
+          bind(make_stream, config),
+          bind(make_logger, config),
+          args)
+    else:
+      raise NotImplementedError(
+          f'behavior1k only supports script=train, got {config.script}')
+    return
+
   if suite == 'maniskill':
     num_envs = dict(config.env.get('maniskill', {})).get('num_envs', 32)
     args = args.update(envs=1, debug=False)  # one env call, no subprocess
@@ -269,6 +284,7 @@ def make_env(config, index, **overrides):
       # ManiSkill: builds the batched GPU env directly.
       # Skips wrap_env — batched obs are not compatible with scalar wrappers.
       'maniskill': 'embodied.envs.maniskill:ManiSkill',
+      'behavior1k': 'embodied.envs.omnigibson:OmniGibson',
   }[suite]
   if isinstance(ctor, str):
     module, cls = ctor.split(':')
@@ -281,8 +297,8 @@ def make_env(config, index, **overrides):
   if kwargs.pop('use_logdir', False):
     kwargs['logdir'] = elements.Path(config.logdir) / f'env{index}'
   env = ctor(task, **kwargs)
-  if suite == 'maniskill':
-    return env   # no wrappers: Driver handles batched obs internally
+  if suite in ('maniskill', 'behavior1k'):
+    return env   # no scalar wrappers: obs spaces are already correct
   return wrap_env(env, config)
 
 
