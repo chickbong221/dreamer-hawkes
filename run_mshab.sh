@@ -43,10 +43,10 @@ export VK_ICD_FILENAMES=$NVIDIA_USERSPACE_DIR/nvidia_icd_egl.json
 vulkaninfo --summary
 
 # Move to project directory
-cd /home/$USERNAME/projects/dreamer-maniskill-hab
+cd /home/$USERNAME/dreamer-hawkes
 
 export WANDB_API_KEY="b1d6eed8871c7668a889ae74a621b5dbd2f3b070"
-export MS_ASSET_DIR=/mnt/data/$USERNAME
+export MS_ASSET_DIR=/mnt/data/tuannl
 
 # Print initial GPU state
 nvidia-smi
@@ -63,7 +63,7 @@ unset XLA_PYTHON_CLIENT_MEM_FRACTION
 python -m dreamerv3.main \
   --configs maniskill_rgb mshab \
   --task maniskill_PlaceSubtaskTrain-v0 \
-  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+  --logdir ~/logdir/maniskill/$TIMESTAMP \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
   --logger.wandb_name dreamerv3-mshab-place-set-table
@@ -71,7 +71,7 @@ python -m dreamerv3.main \
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb mshab \
 #   --task maniskill_OpenSubtaskTrain-v0 \
-#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+#   --logdir ~/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --env.maniskill.mshab_obj kitchen_counter \
@@ -80,7 +80,7 @@ python -m dreamerv3.main \
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb mshab \
 #   --task maniskill_OpenSubtaskTrain-v0 \
-#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+#   --logdir ~/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --env.maniskill.mshab_obj fridge \
@@ -89,7 +89,7 @@ python -m dreamerv3.main \
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb mshab \
 #   --task maniskill_CloseSubtaskTrain-v0 \
-#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+#   --logdir ~/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --env.maniskill.mshab_obj kitchen_counter \
@@ -98,7 +98,7 @@ python -m dreamerv3.main \
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb mshab \
 #   --task maniskill_CloseSubtaskTrain-v0 \
-#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+#   --logdir ~/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --env.maniskill.mshab_obj fridge \
@@ -107,7 +107,7 @@ python -m dreamerv3.main \
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb mshab \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
-#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+#   --logdir ~/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task tidy_house \
 #   --logger.wandb_name dreamerv3-mshab-navigate-tidy-house
@@ -115,7 +115,7 @@ python -m dreamerv3.main \
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb mshab \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
-#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+#   --logdir ~/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task prepare_groceries \
 #   --logger.wandb_name dreamerv3-mshab-navigate-prepare-groceries
@@ -123,7 +123,7 @@ python -m dreamerv3.main \
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb mshab \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
-#   --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+#   --logdir ~/logdir/maniskill/$TIMESTAMP \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
 #   --logger.wandb_name dreamerv3-mshab-navigate-set-table

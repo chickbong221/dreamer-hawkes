@@ -43,10 +43,10 @@ export VK_ICD_FILENAMES=$NVIDIA_USERSPACE_DIR/nvidia_icd_egl.json
 vulkaninfo --summary
 
 # Move to project directory
-cd /home/$USERNAME/projects/dreamer-maniskill-hab
+cd /home/$USERNAME/dreamer-hawkes
 
 export WANDB_API_KEY="b1d6eed8871c7668a889ae74a621b5dbd2f3b070"
-export MS_ASSET_DIR=/mnt/data/$USERNAME
+export MS_ASSET_DIR=/mnt/data/tuannl
 
 # Print initial GPU state
 nvidia-smi
@@ -62,43 +62,43 @@ unset XLA_PYTHON_CLIENT_MEM_FRACTION
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_PushCube-v1 \
-  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+  --logdir ~/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-PushCube
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_PickCube-v1 \
-  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+  --logdir ~/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-PickCube
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_StackCube-v1 \
-  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+  --logdir ~/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-StackCube
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_PegInsertionSide-v1 \
-  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+  --logdir ~/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-PegInsertionSide
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_PushT-v1 \
-  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+  --logdir ~/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-PushT
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_AnymalC-Reach-v1 \
-  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+  --logdir ~/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-AnymalC-Reach
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_UnitreeG1TransportBox-v1 \
-  --logdir /mnt/data/$USERNAME/logdir/maniskill/$TIMESTAMP \
+  --logdir ~/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-UnitreeG1TransportBox
 
 # Stop GPU monitor

@@ -50,6 +50,7 @@ defaults:
       mshab_task: 'none'
       mshab_split: train
       mshab_obj: all
+      nonprivileged_obs: false
 
   replay:
     size: 5e6
@@ -251,10 +252,10 @@ maniskill_rgb:
   run:
     envs: 1
     eval_envs: 4
-    eval_eps: 1
+    eval_eps: 10
     eval_freq: 20000
     eval_video_freq: 1000000
-    train_ratio: 256.0   # lower than state: CNN encoder adds cost per update
+    train_ratio: 128.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
     save_every: 500000
@@ -263,7 +264,7 @@ maniskill_rgb:
   batch_length: 64
   replay_context: 1
   replay:
-    size: 450000        # TD-MPC2 rgb: buffer_size=100_000 (pixels expensive)
+    size: 300000        # TD-MPC2 rgb: buffer_size=100_000 (pixels expensive)
     online: true
     fracs: {uniform: 1.0, priority: 0.0, recency: 0.0}
   jax:
@@ -278,7 +279,7 @@ maniskill_rgb:
     maniskill:
       use_seed: true
       num_envs: 252
-      obs_mode: rgb
+      obs_mode: rgbd
       sim_backend: gpu
       image_size: 128
       control_mode: pd_joint_delta_pos

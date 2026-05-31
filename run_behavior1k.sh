@@ -19,7 +19,7 @@ source ~/miniconda3/etc/profile.d/conda.sh
 conda activate behavior
 
 # Move to project directory
-cd /home/$USERNAME/projects/dreamer-maniskill-hab
+cd /home/$USERNAME/dreamer-hawkes
 
 export WANDB_API_KEY="b1d6eed8871c7668a889ae74a621b5dbd2f3b070"
 export OMNIGIBSON_ASSET_PATH=/mnt/data/$USERNAME/og_assets
@@ -39,19 +39,19 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 python -m dreamerv3.main \
   --configs behavior1k \
   --task behavior1k_picking_up_trash \
-  --logdir /mnt/data/$USERNAME/logdir/behavior1k/$TIMESTAMP \
+  --logdir ~/logdir/behavior1k/$TIMESTAMP \
   --logger.wandb_name dreamerv3-b1k-picking-up-trash
 
 # python -m dreamerv3.main \
 #   --configs behavior1k \
 #   --task behavior1k_washing_dishes \
-#   --logdir /mnt/data/$USERNAME/logdir/behavior1k/$TIMESTAMP \
+#   --logdir ~/logdir/behavior1k/$TIMESTAMP \
 #   --logger.wandb_name dreamerv3-b1k-washing-dishes
 
 # python -m dreamerv3.main \
 #   --configs behavior1k \
 #   --task behavior1k_cleaning_floors \
-#   --logdir /mnt/data/$USERNAME/logdir/behavior1k/$TIMESTAMP \
+#   --logdir ~/logdir/behavior1k/$TIMESTAMP \
 #   --logger.wandb_name dreamerv3-b1k-cleaning-floors
 
 # Stop GPU monitor

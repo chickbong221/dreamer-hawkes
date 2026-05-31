@@ -37,6 +37,7 @@ class ManiSkill(embodied.Env):
       mshab_task=None,
       mshab_split='train',
       mshab_obj='all',
+      nonprivileged_obs=False,
       **kwargs,
   ):
     import gymnasium as gym
@@ -100,8 +101,9 @@ class ManiSkill(embodied.Env):
 
     env = gym.make(**make_kwargs)
 
-    from embodied.envs.obs_wrappers import NonPrivilegedObsWrapper
-    env = NonPrivilegedObsWrapper(env)
+    if nonprivileged_obs:
+      from embodied.envs.obs_wrappers import NonPrivilegedObsWrapper
+      env = NonPrivilegedObsWrapper(env)
 
     if 'rgb' in obs_mode:
       # Matches TD-MPC2's RGB path: flatten RGBD observation into rgb + state.
