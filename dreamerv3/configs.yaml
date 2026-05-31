@@ -252,7 +252,7 @@ maniskill_rgb:
   run:
     envs: 1
     eval_envs: 4
-    eval_eps: 10
+    eval_eps: 1
     eval_freq: 20000
     eval_video_freq: 1000000
     train_ratio: 128.0   # lower than state: CNN encoder adds cost per update
