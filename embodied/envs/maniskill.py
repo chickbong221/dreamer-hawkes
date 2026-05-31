@@ -38,6 +38,7 @@ class ManiSkill(embodied.Env):
       mshab_split='train',
       mshab_obj='all',
       nonprivileged_obs=False,
+      max_depth=10.0,
       **kwargs,
   ):
     import gymnasium as gym
@@ -51,6 +52,7 @@ class ManiSkill(embodied.Env):
     self._num_frames = int(num_frames)
     self._device = 'cuda'
     self._is_eval = bool(is_eval)
+    self._max_depth = float(max_depth)
 
     # TD-MPC2 uses cfg.render_mode, default rgb_array, and the eval env gets
     # video recording. For Dreamer, always make eval renderable; for training,
@@ -131,6 +133,9 @@ class ManiSkill(embodied.Env):
     if 'rgb' in obs_mode and self._num_frames > 1:
       self._setup_frame_stack(obs)
 
+    if obs_mode == 'depth' and self._num_frames > 1:
+      self._setup_depth_stack(obs)
+
     # Track per-env done to compute is_first on the next step.
     self._prev_done = np.ones(self._num_envs, dtype=bool)
 
@@ -166,6 +171,12 @@ class ManiSkill(embodied.Env):
           self._img_c * self._num_frames,
       )
 
+    if self._obs_mode == 'depth':
+      d = obs['sensor_data']['fetch_head']['depth']  # [N, H, W, 1]
+      self._depth_h = d.shape[1]
+      self._depth_w = d.shape[2]
+      self._depth_shape = (self._depth_h, self._depth_w, self._num_frames)
+
   def _setup_frame_stack(self, obs):
     rgb = obs['rgb'].float() / 255.0  # [N, H, W, C]
     self._frame_buf = (
@@ -174,6 +185,14 @@ class ManiSkill(embodied.Env):
            .clone()
     )
     self._stack_ptr = 0
+
+  def _setup_depth_stack(self, obs):
+    def _repeat(key):
+      d = obs['sensor_data'][key]['depth'].float() / self._max_depth  # [N, H, W, 1]
+      return d.unsqueeze(-1).expand(-1, -1, -1, -1, self._num_frames).clone()
+    self._depth_head_buf = _repeat('fetch_head')
+    self._depth_hand_buf = _repeat('fetch_hand')
+    self._depth_stack_ptr = 0
 
   # ------------------------------------------------------------------ #
   #  embodied.Env interface
@@ -195,6 +214,9 @@ class ManiSkill(embodied.Env):
     }
     if 'rgb' in self._obs_mode:
       spaces['image'] = elements.Space(np.uint8, self._img_shape)
+    if self._obs_mode == 'depth':
+      spaces['depth_head'] = elements.Space(np.uint8, self._depth_shape)
+      spaces['depth_hand'] = elements.Space(np.uint8, self._depth_shape)
     return spaces
 
   @property
@@ -231,6 +253,18 @@ class ManiSkill(embodied.Env):
             .expand(-1, -1, -1, -1, self._num_frames)
             .clone()
         )
+
+      if self._obs_mode == 'depth' and self._num_frames > 1:
+        def _reset_depth_buf(buf, key):
+          d = obs['sensor_data'][key]['depth'].float() / self._max_depth
+          buf[reset_idx] = (
+              d[reset_idx]
+              .unsqueeze(-1)
+              .expand(-1, -1, -1, -1, self._num_frames)
+              .clone()
+          )
+        _reset_depth_buf(self._depth_head_buf, 'fetch_head')
+        _reset_depth_buf(self._depth_hand_buf, 'fetch_hand')
 
       is_first = reset_mask.copy()
       self._prev_done[reset_mask] = False
@@ -313,6 +347,29 @@ class ManiSkill(embodied.Env):
           f'Expected "state", "agent", or "extra".')
     return torch.cat(parts, dim=-1).cpu().float().numpy()
 
+  def _extract_depth(self, obs):
+    """Return (depth_head, depth_hand) as uint8 [N, H, W, num_frames]."""
+    head = obs['sensor_data']['fetch_head']['depth'].float() / self._max_depth  # [N, H, W, 1]
+    hand = obs['sensor_data']['fetch_hand']['depth'].float() / self._max_depth
+
+    if self._num_frames == 1:
+      head_out = head[..., 0:1]  # [N, H, W, 1]
+      hand_out = hand[..., 0:1]
+    else:
+      self._depth_head_buf[..., self._depth_stack_ptr] = head
+      self._depth_hand_buf[..., self._depth_stack_ptr] = hand
+      self._depth_stack_ptr = (self._depth_stack_ptr + 1) % self._num_frames
+      head_stacked = self._depth_head_buf.roll(shifts=-self._depth_stack_ptr, dims=-1)
+      hand_stacked = self._depth_hand_buf.roll(shifts=-self._depth_stack_ptr, dims=-1)
+      N, H, W, C, F = head_stacked.shape
+      head_out = head_stacked.reshape(N, H, W, C * F)  # [N, H, W, num_frames]
+      hand_out = hand_stacked.reshape(N, H, W, C * F)
+
+    def to_uint8(t):
+      return (t.clamp(0, 1).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+    return to_uint8(head_out), to_uint8(hand_out)
+
   def _stack_frames(self, obs):
     """Return uint8 image [N, H, W, C*num_frames] in channels-last layout."""
     rgb = obs['rgb'].float() / 255.0  # [N, H, W, C]
@@ -345,6 +402,10 @@ class ManiSkill(embodied.Env):
     }
     if 'rgb' in self._obs_mode:
       out['image'] = self._stack_frames(obs)
+    if self._obs_mode == 'depth':
+      depth_head, depth_hand = self._extract_depth(obs)
+      out['depth_head'] = depth_head
+      out['depth_hand'] = depth_hand
     if log_metrics:
       out.update(log_metrics)
     return out

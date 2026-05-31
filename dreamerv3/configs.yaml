@@ -279,7 +279,7 @@ maniskill_rgb:
     maniskill:
       use_seed: true
       num_envs: 252
-      obs_mode: rgbd
+      obs_mode: rgb
       sim_backend: gpu
       image_size: 128
       control_mode: pd_joint_delta_pos
@@ -290,6 +290,9 @@ mshab:
   batch_size: 32
   run:
     steps: 10e6
+  env:
+    maniskill:
+      obs_mode: depth
 
 behavior1k:
   <<: *size100m
