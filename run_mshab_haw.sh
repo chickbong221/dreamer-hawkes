@@ -46,7 +46,7 @@ export VK_ICD_FILENAMES=$NVIDIA_USERSPACE_DIR/nvidia_icd_egl.json
 vulkaninfo --summary
 
 # Move to project directory
-cd /home/$USERNAME/dreamer-hawkes
+cd $HOME/projects/dreamer-hawkes
 
 export WANDB_API_KEY="b1d6eed8871c7668a889ae74a621b5dbd2f3b070"
 export MS_ASSET_DIR=/mnt/data/tuannl
@@ -55,7 +55,7 @@ export MS_ASSET_DIR=/mnt/data/tuannl
 nvidia-smi
 
 # Monitor GPU every 20 seconds in background
-nvidia-smi -l 100 > $HOME/mnt_data/output/gpu_${SLURM_JOB_ID}.log &
+nvidia-smi -l 100 > $HOME/output/gpu_${SLURM_JOB_ID}.log &
 GPU_MONITOR_PID=$!
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -64,7 +64,7 @@ unset XLA_PYTHON_CLIENT_MEM_FRACTION
 
 python -m dreamerv3.main \
   --configs maniskill_rgb  mshab hawkes \
-  --logdir /home/%u/logdir/maniskill/$TIMESTAMP \
+  --logdir $HOME/logdir/maniskill/$TIMESTAMP \
   --task maniskill_PlaceSubtaskTrain-v0 \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
@@ -72,7 +72,7 @@ python -m dreamerv3.main \
 
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb  mshab hawkes \
-#   --logdir /home/%u/logdir/maniskill/$TIMESTAMP \
+#   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
 #   --task maniskill_OpenSubtaskTrain-v0 \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
@@ -81,7 +81,7 @@ python -m dreamerv3.main \
 
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb  mshab hawkes \
-#   --logdir /home/%u/logdir/maniskill/$TIMESTAMP \
+#   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
 #   --task maniskill_OpenSubtaskTrain-v0 \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
@@ -90,7 +90,7 @@ python -m dreamerv3.main \
 
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb  mshab hawkes \
-#   --logdir /home/%u/logdir/maniskill/$TIMESTAMP \
+#   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
 #   --task maniskill_CloseSubtaskTrain-v0 \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
@@ -99,7 +99,7 @@ python -m dreamerv3.main \
 
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb  mshab hawkes \
-#   --logdir /home/%u/logdir/maniskill/$TIMESTAMP \
+#   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
 #   --task maniskill_CloseSubtaskTrain-v0 \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
@@ -108,7 +108,7 @@ python -m dreamerv3.main \
 
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb  mshab hawkes \
-#   --logdir /home/%u/logdir/maniskill/$TIMESTAMP \
+#   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task tidy_house \
@@ -116,7 +116,7 @@ python -m dreamerv3.main \
 
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb  mshab hawkes \
-#   --logdir /home/%u/logdir/maniskill/$TIMESTAMP \
+#   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task prepare_groceries \
@@ -124,7 +124,7 @@ python -m dreamerv3.main \
 
 # python -m dreamerv3.main \
 #   --configs maniskill_rgb  mshab hawkes \
-#   --logdir /home/%u/logdir/maniskill/$TIMESTAMP \
+#   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
 #   --task maniskill_NavigateSubtaskTrain-v0 \
 #   --env.maniskill.control_mode pd_joint_delta_pos \
 #   --env.maniskill.mshab_task set_table \
