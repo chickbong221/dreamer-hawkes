@@ -27,25 +27,7 @@ cd $HOME/nvidia-userspace
 wget https://us.download.nvidia.com/tesla/570.133.20/NVIDIA-Linux-x86_64-570.133.20.run
 ```
 
-**4. Create data folder and home alias**
-
-```bash
-mkdir -p /mnt/data/$USER
-ln -sfn /mnt/data/$USER $HOME/mnt_data
-mkdir -p $HOME/mnt_data/output
-```
-
-**5. Download simulation assets**
-
-```bash
-export MS_ASSET_DIR=/mnt/data/$USER
-
-for dataset in ycb ReplicaCAD ReplicaCADRearrange; do
-    python -m mani_skill.utils.download_asset "$dataset"
-done
-```
-
-**6. Submit training job**
+**4. Submit training job**
 
 | Script | Description |
 |--------|-------------|
