@@ -292,7 +292,7 @@ class ManiSkill(embodied.Env):
       final = info['final_observation']
       done_t = torch.tensor(done, dtype=torch.bool, device=self._device)
       for key in obs:
-        if key in final:
+        if key in final and isinstance(obs[key], torch.Tensor):
           expand = done_t.view(-1, *([1] * (obs[key].dim() - 1)))
           obs[key] = torch.where(expand.expand_as(obs[key]), final[key], obs[key])
 
