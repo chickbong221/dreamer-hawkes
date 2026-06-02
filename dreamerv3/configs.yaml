@@ -258,7 +258,7 @@ maniskill_rgb:
     train_ratio: 128.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
-    save_every: 500000
+    save_every: 0
     report_every: 500000
   batch_size: 32        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
   batch_length: 64
@@ -293,6 +293,8 @@ mshab:
   env:
     maniskill:
       obs_mode: depth
+  replay:
+    size: 1000000
 
 behavior1k:
   <<: *size100m
