@@ -14,9 +14,13 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "GPUs allocated: $CUDA_VISIBLE_DEVICES"
 echo "================================="
 
+# Anh Duong
+source "$HOME/ENTER/etc/profile.d/conda.sh"
+conda activate "$HOME/ENTER/envs/dreamer"
+
 # Activate conda
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate dreamer
+# source ~/miniconda3/etc/profile.d/conda.sh
+# conda activate dreamer
 
 export NVIDIA_USERSPACE_VERSION=570.133.20
 export NVIDIA_USERSPACE_DIR=$HOME/nvidia-userspace/NVIDIA-Linux-x86_64-${NVIDIA_USERSPACE_VERSION}
