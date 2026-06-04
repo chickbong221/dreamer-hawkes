@@ -46,7 +46,6 @@ vulkaninfo --summary
 cd $HOME/projects/dreamer-hawkes
 
 export WANDB_API_KEY="b1d6eed8871c7668a889ae74a621b5dbd2f3b070"
-export MS_ASSET_DIR=/mnt/data/tuannl
 
 # Print initial GPU state
 nvidia-smi
