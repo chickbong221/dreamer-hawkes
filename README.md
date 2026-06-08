@@ -25,6 +25,7 @@ bash install.sh
 mkdir -p $HOME/nvidia-userspace
 cd $HOME/nvidia-userspace
 wget https://us.download.nvidia.com/tesla/570.133.20/NVIDIA-Linux-x86_64-570.133.20.run
+sh NVIDIA-Linux-x86_64-570.133.20.run --extract-only
 ```
 
 **4. Submit training job**
