@@ -51,6 +51,9 @@ defaults:
       mshab_split: train
       mshab_obj: all
       nonprivileged_obs: false
+      max_episode_steps: 0       # 0 → use the registered default; mshab overrides to 100
+      eval_max_episode_steps: 0  # 0 → reuse max_episode_steps; mshab overrides to 200
+      frame_stack: 1             # mshab path: no FrameStack wrapper
 
   replay:
     size: 5e6
@@ -252,14 +255,14 @@ maniskill_rgb:
   run:
     envs: 1
     eval_envs: 4
-    eval_eps: 1
+    eval_eps: 4
     eval_freq: 20000
     eval_video_freq: 1000000
     train_ratio: 128.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
-    save_every: 0
-    report_every: 500000
+    save_every: 50000
+    report_every: 50000
   batch_size: 32        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
   batch_length: 64
   replay_context: 1
@@ -290,9 +293,13 @@ mshab:
   batch_size: 32
   run:
     steps: 10e6
+    eval_eps: 4                # 4 eval episodes per eval_envs
   env:
     maniskill:
       obs_mode: depth
+      max_episode_steps: 100        # matches mshab/configs/sac_pick.yml training horizon
+      eval_max_episode_steps: 200   # matches mshab/configs/sac_pick.yml eval horizon
+      frame_stack: 1                # no MSHab FrameStack; RSSM provides temporal context
   replay:
     size: 1000000
 

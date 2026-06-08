@@ -61,42 +61,49 @@ unset XLA_PYTHON_CLIENT_MEM_FRACTION
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_PushCube-v1 \
+  --run.steps 1e6 \
   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-PushCube
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_PickCube-v1 \
+  --run.steps 1e6 \
   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-PickCube
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_StackCube-v1 \
+  --run.steps 4e6 \
   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-StackCube
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_PegInsertionSide-v1 \
+  --run.steps 4e6 \
   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-PegInsertionSide
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_PushT-v1 \
+  --run.steps 2e6 \
   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-PushT
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_AnymalC-Reach-v1 \
+  --run.steps 2e6 \
   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-AnymalC-Reach
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
   --task maniskill_UnitreeG1TransportBox-v1 \
+  --run.steps 2e6 \
   --logdir $HOME/logdir/maniskill/$TIMESTAMP \
   --logger.wandb_name hawkes-dreamerv3-UnitreeG1TransportBox
 

@@ -325,10 +325,15 @@ class Agent(embodied.jax.Agent):
       return x[..., :3]
 
     for key in self.dec.imgkeys:
-      assert obs[key].dtype == jnp.uint8
+      assert obs[key].dtype in (jnp.uint8, jnp.float32)
       true = obs[key][:RB]
       pred = jnp.concatenate([obsrecons[key].pred(), imgrecons[key].pred()], 1)
-      pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
+      if true.dtype == jnp.uint8:
+        pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
+      else:
+        # Float depth (already in [0, 1] via wrapper /max_depth) → scale up.
+        true = jnp.clip(true * 255, 0, 255).astype(jnp.uint8)
+        pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
       true = to_report_rgb(true)
       pred = to_report_rgb(pred)
       error = ((i32(pred) - i32(true) + 255) / 2).astype(np.uint8)

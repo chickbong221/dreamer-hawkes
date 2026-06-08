@@ -39,6 +39,9 @@ class ManiSkill(embodied.Env):
       mshab_obj='all',
       nonprivileged_obs=False,
       max_depth=10.0,
+      max_episode_steps=None,
+      eval_max_episode_steps=None,
+      frame_stack=1,
       **kwargs,
   ):
     import gymnasium as gym
@@ -53,6 +56,21 @@ class ManiSkill(embodied.Env):
     self._device = 'cuda'
     self._is_eval = bool(is_eval)
     self._max_depth = float(max_depth)
+    self._mshab_active = mshab_task is not None and mshab_task != 'none'
+    self._frame_stack = max(int(frame_stack), 1)
+    # 0/None → keep the env's registered default; positive → override.
+    # Eval gets its own horizon to mirror mshab/configs/sac_pick.yml
+    # (train 100, eval 200) — falls back to max_episode_steps if unset.
+    def _resolve_horizon(value):
+      if value is None or int(value) <= 0:
+        return None
+      return int(value)
+    train_override = _resolve_horizon(max_episode_steps)
+    eval_override = _resolve_horizon(eval_max_episode_steps)
+    if self._is_eval and eval_override is not None:
+      self._max_episode_steps_override = eval_override
+    else:
+      self._max_episode_steps_override = train_override
 
     # TD-MPC2 uses cfg.render_mode, default rgb_array, and the eval env gets
     # video recording. For Dreamer, always make eval renderable; for training,
@@ -77,7 +95,7 @@ class ManiSkill(embodied.Env):
     if control_mode is not None:
       make_kwargs['control_mode'] = control_mode
 
-    if mshab_task is not None and mshab_task != 'none':
+    if self._mshab_active:
       import mshab.envs  # noqa: F401 registers mshab tasks
       from mani_skill import ASSET_DIR
       from mshab.envs.planner import plan_data_from_file
@@ -96,6 +114,12 @@ class ManiSkill(embodied.Env):
       make_kwargs['require_build_configs_repeated_equally_across_envs'] = False
       # Use normalised rewards matching mshab's own training code.
       make_kwargs.setdefault('reward_mode', 'normalized_dense')
+      # Match mshab/configs/sac_pick.yml: training horizon 100, eval 200.
+      # is_eval selects eval_max_episode_steps above.
+      if self._max_episode_steps_override is not None:
+        make_kwargs['max_episode_steps'] = self._max_episode_steps_override
+      # Match SAC's shader_dir to keep depth rendering identical.
+      make_kwargs.setdefault('shader_dir', 'minimal')
     if is_eval:
       # TD-MPC2 creates a separate eval env and adds
       # reconfiguration_freq=cfg.eval_reconfiguration_frequency.
@@ -112,6 +136,25 @@ class ManiSkill(embodied.Env):
       env = FlattenRGBDObservationWrapper(
           env, rgb=True, depth=False, state=True)
 
+    # MSHab depth path: apply the same per-env wrappers as
+    # mshab/mshab/envs/make.py (minus FrameStack, since DreamerV3's RSSM
+    # supplies temporal context). FetchDepthObservationWrapper produces
+    # {state, fetch_head_depth, fetch_hand_depth} with the depth tensors
+    # permuted to channel-first. FetchActionWrapper zeros the two head joints
+    # (stationary_head=True matches sac_pick.yml).
+    if self._mshab_active and obs_mode == 'depth':
+      from mshab.envs.wrappers import (
+          FetchActionWrapper,
+          FetchDepthObservationWrapper,
+      )
+      env = FetchDepthObservationWrapper(
+          env, cat_state=True, cat_pixels=False)
+      env = FetchActionWrapper(
+          env,
+          stationary_base=False,
+          stationary_torso=False,
+          stationary_head=True)
+
     # Read the registered horizon before vector wrapping, same as TD-MPC2.
     from mani_skill.utils import gym_utils as _gym_utils
     self._max_episode_steps = _gym_utils.find_max_episode_steps_value(env)
@@ -123,8 +166,11 @@ class ManiSkill(embodied.Env):
 
     # ignore_terminations=True: episodes end only on truncation.
     # record_metrics=True: populates info['final_info']['episode'].
-    self._env = ManiSkillVectorEnv(
-        env, ignore_terminations=True, record_metrics=True)
+    vec_kwargs = dict(ignore_terminations=True, record_metrics=True)
+    if self._mshab_active and self._max_episode_steps_override is not None:
+      # Match SAC: VectorRecordEpisodeStatistics is built around this horizon.
+      vec_kwargs['max_episode_steps'] = self._max_episode_steps_override
+    self._env = ManiSkillVectorEnv(env, **vec_kwargs)
 
     # Warm reset to discover obs/act shapes.
     obs, _ = self._env.reset(seed=seed)
@@ -133,7 +179,10 @@ class ManiSkill(embodied.Env):
     if 'rgb' in obs_mode and self._num_frames > 1:
       self._setup_frame_stack(obs)
 
-    if obs_mode == 'depth' and self._num_frames > 1:
+    # MSHab path runs without DreamerV3-side frame stacking (matches SAC's
+    # config when frame_stack is 1 / DreamerV3's RSSM handles temporal context).
+    if (obs_mode == 'depth' and not self._mshab_active
+        and self._num_frames > 1):
       self._setup_depth_stack(obs)
 
     # Track per-env done to compute is_first on the next step.
@@ -172,10 +221,18 @@ class ManiSkill(embodied.Env):
       )
 
     if self._obs_mode == 'depth':
-      d = obs['sensor_data']['fetch_head']['depth']  # [N, H, W, 1]
-      self._depth_h = d.shape[1]
-      self._depth_w = d.shape[2]
-      self._depth_shape = (self._depth_h, self._depth_w, self._num_frames)
+      if self._mshab_active:
+        # FetchDepthObservationWrapper permutes to [N, 1, H, W].
+        d = obs['fetch_head_depth']
+        self._depth_h = d.shape[-2]
+        self._depth_w = d.shape[-1]
+        # No DreamerV3-side frame stacking on the MSHab path → 1 channel.
+        self._depth_shape = (self._depth_h, self._depth_w, 1)
+      else:
+        d = obs['sensor_data']['fetch_head']['depth']  # [N, H, W, 1]
+        self._depth_h = d.shape[1]
+        self._depth_w = d.shape[2]
+        self._depth_shape = (self._depth_h, self._depth_w, self._num_frames)
 
   def _setup_frame_stack(self, obs):
     rgb = obs['rgb'].float() / 255.0  # [N, H, W, C]
@@ -215,8 +272,17 @@ class ManiSkill(embodied.Env):
     if 'rgb' in self._obs_mode:
       spaces['image'] = elements.Space(np.uint8, self._img_shape)
     if self._obs_mode == 'depth':
-      spaces['depth_head'] = elements.Space(np.uint8, self._depth_shape)
-      spaces['depth_hand'] = elements.Space(np.uint8, self._depth_shape)
+      if self._mshab_active:
+        # Float32 depth scaled to [0, 1] by max_depth (lossless vs uint8's
+        # ~3.9cm quantisation), so the CNN encoder and sigmoid+MSE decoder
+        # operate on the same value range as the standard image path.
+        spaces['depth_head'] = elements.Space(
+            np.float32, self._depth_shape, 0.0, 1.0)
+        spaces['depth_hand'] = elements.Space(
+            np.float32, self._depth_shape, 0.0, 1.0)
+      else:
+        spaces['depth_head'] = elements.Space(np.uint8, self._depth_shape)
+        spaces['depth_hand'] = elements.Space(np.uint8, self._depth_shape)
     return spaces
 
   @property
@@ -254,7 +320,8 @@ class ManiSkill(embodied.Env):
             .clone()
         )
 
-      if self._obs_mode == 'depth' and self._num_frames > 1:
+      if (self._obs_mode == 'depth' and not self._mshab_active
+          and self._num_frames > 1):
         def _reset_depth_buf(buf, key):
           d = obs['sensor_data'][key]['depth'].float() / self._max_depth
           buf[reset_idx] = (
@@ -348,7 +415,23 @@ class ManiSkill(embodied.Env):
     return torch.cat(parts, dim=-1).cpu().float().numpy()
 
   def _extract_depth(self, obs):
-    """Return (depth_head, depth_hand) as uint8 [N, H, W, num_frames]."""
+    """Return (depth_head, depth_hand) as uint8 [N, H, W, num_frames] for the
+    non-MSHab path, or float32 metres [N, H, W, 1] for the MSHab path."""
+    if self._mshab_active:
+      # FetchDepthObservationWrapper output: [N, 1, H, W] channel-first.
+      # Convert to channels-last [N, H, W, 1] and scale to [0, 1] (divide by
+      # max_depth, clipped). Keeps float32 precision — no uint8 quantisation —
+      # while staying compatible with DreamerV3's sigmoid+MSE decoder target.
+      def _to_hwc(t):
+        t = t.permute(0, 2, 3, 1).contiguous().float() / self._max_depth
+        return t.clamp(0.0, 1.0)
+      head = _to_hwc(obs['fetch_head_depth'])
+      hand = _to_hwc(obs['fetch_hand_depth'])
+      return (
+          head.cpu().numpy().astype(np.float32),
+          hand.cpu().numpy().astype(np.float32),
+      )
+
     head = obs['sensor_data']['fetch_head']['depth'].float() / self._max_depth  # [N, H, W, 1]
     hand = obs['sensor_data']['fetch_hand']['depth'].float() / self._max_depth
 

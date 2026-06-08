@@ -40,14 +40,12 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     return getattr(args, name, default)
 
   # TD-MPC2 defaults: num_eval_envs=4, eval_episodes_per_env=2.
-  # For your requested setup, keep eval_eps=1 and set eval_envs=4.
+  # Total eval episodes per call = eval_envs * eval_eps; per-episode metrics
+  # are averaged in `all_metrics` below, so any positive eval_eps is supported.
   eval_freq = int(float(_arg('eval_freq', 50000)))
   eval_video_freq = int(float(_arg('eval_video_freq', 0)))
   eval_num_envs = int(_arg('eval_envs', 4))
-  eval_episodes_per_env = int(_arg('eval_eps', 1))
-  assert eval_episodes_per_env == 1, (
-      'This TD-MPC2-compatible eval path is configured for '
-      f'eval_episodes_per_env=1, got eval_eps={eval_episodes_per_env}.')
+  eval_episodes_per_env = max(int(_arg('eval_eps', 1)), 1)
 
   # ManiSkill episode-level metrics that TD-MPC2 logs once per completed
   # training vector episode batch as mean over cfg.num_envs.
