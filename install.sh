@@ -14,7 +14,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONDA_BASE="$(conda info --base)"
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 
-# conda create -n dreamer python=3.11 -y
+conda create -n dreamer python=3.11 -y
 conda activate dreamer
 
 # ── 1. Check dependencies cloned ────────────────────────────────────────────
