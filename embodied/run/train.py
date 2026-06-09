@@ -364,7 +364,10 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   if args.from_checkpoint:
     elements.checkpoint.load(args.from_checkpoint, dict(
         agent=bind(agent.load, regex=args.from_checkpoint_regex)))
-  cp.load_or_save()
+  # Only resume from the run's own ckpt dir if it already exists; do not
+  # auto-save a fresh checkpoint at start. End-of-training cp.save() still runs.
+  if (logdir / 'ckpt').exists():
+    cp.load()
 
   print('Start training loop')
   policy = lambda *xs: agent.policy(*xs, mode='train')
