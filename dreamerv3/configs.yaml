@@ -54,6 +54,7 @@ defaults:
       max_episode_steps: 0       # 0 → use the registered default; mshab overrides to 100
       eval_max_episode_steps: 0  # 0 → reuse max_episode_steps; mshab overrides to 200
       frame_stack: 1             # mshab path: no FrameStack wrapper
+      reward_mode: normalized_dense  # 'sparse' | 'dense' | 'normalized_dense'
 
   replay:
     size: 5e6
@@ -262,7 +263,7 @@ maniskill_rgb:
     steps: 2e6
     log_every: 1500
     save_every: 50000
-    report_every: 50000
+    report_every: 7200
   batch_size: 32        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
   batch_length: 64
   replay_context: 1
@@ -294,6 +295,7 @@ mshab:
   run:
     steps: 10e6
     eval_eps: 4                # 4 eval episodes per eval_envs
+    report_every: 36000
   env:
     maniskill:
       obs_mode: depth
