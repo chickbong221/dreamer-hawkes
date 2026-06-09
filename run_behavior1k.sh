@@ -39,19 +39,19 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 python -m dreamerv3.main \
   --configs behavior1k \
   --task behavior1k_picking_up_trash \
-  --logdir $HOME/logdir/behavior1k/$TIMESTAMP \
+  --logdir $HOME/logdir/behavior1k/$TIMESTAMP/picking-up-trash \
   --logger.wandb_name dreamerv3-b1k-picking-up-trash
 
 # python -m dreamerv3.main \
 #   --configs behavior1k \
 #   --task behavior1k_washing_dishes \
-#   --logdir $HOME/logdir/behavior1k/$TIMESTAMP \
+#   --logdir $HOME/logdir/behavior1k/$TIMESTAMP/washing-dishes \
 #   --logger.wandb_name dreamerv3-b1k-washing-dishes
 
 # python -m dreamerv3.main \
 #   --configs behavior1k \
 #   --task behavior1k_cleaning_floors \
-#   --logdir $HOME/logdir/behavior1k/$TIMESTAMP \
+#   --logdir $HOME/logdir/behavior1k/$TIMESTAMP/cleaning-floors \
 #   --logger.wandb_name dreamerv3-b1k-cleaning-floors
 
 # Stop GPU monitor

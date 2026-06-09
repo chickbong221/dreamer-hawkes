@@ -26,7 +26,6 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   should_train = elements.when.Ratio(args.train_ratio / batch_steps)
   should_log = embodied.LocalClock(args.log_every)
   should_report = embodied.LocalClock(args.report_every)
-  should_save = embodied.LocalClock(args.save_every)
 
   start_time = time()
   train_vector_episode_done = [False]
@@ -433,8 +432,7 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       logger.add({'timer': elements.timer.stats()['summary']})
       logger.write()
 
-    if should_save(step):
-      cp.save()
+  cp.save()
 
   if eval_env is not None:
     eval_env.close()
