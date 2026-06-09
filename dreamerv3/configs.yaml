@@ -258,7 +258,7 @@ maniskill_rgb:
     eval_eps: 4
     eval_freq: 20000
     eval_video_freq: 1000000
-    train_ratio: 128.0   # lower than state: CNN encoder adds cost per update
+    train_ratio: 64.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
     save_every: 50000
