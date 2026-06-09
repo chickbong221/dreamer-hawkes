@@ -38,7 +38,7 @@ class ManiSkill(embodied.Env):
       mshab_split='train',
       mshab_obj='all',
       nonprivileged_obs=False,
-      max_depth=10.0,
+      max_depth=10000.0,
       max_episode_steps=None,
       eval_max_episode_steps=None,
       frame_stack=1,
@@ -57,7 +57,6 @@ class ManiSkill(embodied.Env):
     self._is_eval = bool(is_eval)
     self._max_depth = float(max_depth)
     self._mshab_active = mshab_task is not None and mshab_task != 'none'
-    self._frame_stack = max(int(frame_stack), 1)
     # 0/None → keep the env's registered default; positive → override.
     # Eval gets its own horizon to mirror mshab/configs/sac_pick.yml
     # (train 100, eval 200) — falls back to max_episode_steps if unset.
@@ -179,12 +178,6 @@ class ManiSkill(embodied.Env):
     if 'rgb' in obs_mode and self._num_frames > 1:
       self._setup_frame_stack(obs)
 
-    # MSHab path runs without DreamerV3-side frame stacking (matches SAC's
-    # config when frame_stack is 1 / DreamerV3's RSSM handles temporal context).
-    if (obs_mode == 'depth' and not self._mshab_active
-        and self._num_frames > 1):
-      self._setup_depth_stack(obs)
-
     # Track per-env done to compute is_first on the next step.
     self._prev_done = np.ones(self._num_envs, dtype=bool)
 
@@ -221,18 +214,12 @@ class ManiSkill(embodied.Env):
       )
 
     if self._obs_mode == 'depth':
-      if self._mshab_active:
-        # FetchDepthObservationWrapper permutes to [N, 1, H, W].
-        d = obs['fetch_head_depth']
-        self._depth_h = d.shape[-2]
-        self._depth_w = d.shape[-1]
-        # No DreamerV3-side frame stacking on the MSHab path → 1 channel.
-        self._depth_shape = (self._depth_h, self._depth_w, 1)
-      else:
-        d = obs['sensor_data']['fetch_head']['depth']  # [N, H, W, 1]
-        self._depth_h = d.shape[1]
-        self._depth_w = d.shape[2]
-        self._depth_shape = (self._depth_h, self._depth_w, self._num_frames)
+      assert self._mshab_active, 'depth obs_mode is only supported with mshab'
+      # FetchDepthObservationWrapper permutes to [N, 1, H, W].
+      d = obs['fetch_head_depth']
+      self._depth_h = d.shape[-2]
+      self._depth_w = d.shape[-1]
+      self._depth_shape = (self._depth_h, self._depth_w, 1)
 
   def _setup_frame_stack(self, obs):
     rgb = obs['rgb'].float() / 255.0  # [N, H, W, C]
@@ -242,14 +229,6 @@ class ManiSkill(embodied.Env):
            .clone()
     )
     self._stack_ptr = 0
-
-  def _setup_depth_stack(self, obs):
-    def _repeat(key):
-      d = obs['sensor_data'][key]['depth'].float() / self._max_depth  # [N, H, W, 1]
-      return d.unsqueeze(-1).expand(-1, -1, -1, -1, self._num_frames).clone()
-    self._depth_head_buf = _repeat('fetch_head')
-    self._depth_hand_buf = _repeat('fetch_hand')
-    self._depth_stack_ptr = 0
 
   # ------------------------------------------------------------------ #
   #  embodied.Env interface
@@ -272,17 +251,10 @@ class ManiSkill(embodied.Env):
     if 'rgb' in self._obs_mode:
       spaces['image'] = elements.Space(np.uint8, self._img_shape)
     if self._obs_mode == 'depth':
-      if self._mshab_active:
-        # Float32 depth scaled to [0, 1] by max_depth (lossless vs uint8's
-        # ~3.9cm quantisation), so the CNN encoder and sigmoid+MSE decoder
-        # operate on the same value range as the standard image path.
-        spaces['depth_head'] = elements.Space(
-            np.float32, self._depth_shape, 0.0, 1.0)
-        spaces['depth_hand'] = elements.Space(
-            np.float32, self._depth_shape, 0.0, 1.0)
-      else:
-        spaces['depth_head'] = elements.Space(np.uint8, self._depth_shape)
-        spaces['depth_hand'] = elements.Space(np.uint8, self._depth_shape)
+      spaces['depth_head'] = elements.Space(
+          np.float32, self._depth_shape, 0.0, 1.0)
+      spaces['depth_hand'] = elements.Space(
+          np.float32, self._depth_shape, 0.0, 1.0)
     return spaces
 
   @property
@@ -319,19 +291,6 @@ class ManiSkill(embodied.Env):
             .expand(-1, -1, -1, -1, self._num_frames)
             .clone()
         )
-
-      if (self._obs_mode == 'depth' and not self._mshab_active
-          and self._num_frames > 1):
-        def _reset_depth_buf(buf, key):
-          d = obs['sensor_data'][key]['depth'].float() / self._max_depth
-          buf[reset_idx] = (
-              d[reset_idx]
-              .unsqueeze(-1)
-              .expand(-1, -1, -1, -1, self._num_frames)
-              .clone()
-          )
-        _reset_depth_buf(self._depth_head_buf, 'fetch_head')
-        _reset_depth_buf(self._depth_hand_buf, 'fetch_hand')
 
       is_first = reset_mask.copy()
       self._prev_done[reset_mask] = False
@@ -415,43 +374,16 @@ class ManiSkill(embodied.Env):
     return torch.cat(parts, dim=-1).cpu().float().numpy()
 
   def _extract_depth(self, obs):
-    """Return (depth_head, depth_hand) as uint8 [N, H, W, num_frames] for the
-    non-MSHab path, or float32 metres [N, H, W, 1] for the MSHab path."""
-    if self._mshab_active:
-      # FetchDepthObservationWrapper output: [N, 1, H, W] channel-first.
-      # Convert to channels-last [N, H, W, 1] and scale to [0, 1] (divide by
-      # max_depth, clipped). Keeps float32 precision — no uint8 quantisation —
-      # while staying compatible with DreamerV3's sigmoid+MSE decoder target.
-      def _to_hwc(t):
-        t = t.permute(0, 2, 3, 1).contiguous().float() / self._max_depth
-        return t.clamp(0.0, 1.0)
-      head = _to_hwc(obs['fetch_head_depth'])
-      hand = _to_hwc(obs['fetch_hand_depth'])
-      return (
-          head.cpu().numpy().astype(np.float32),
-          hand.cpu().numpy().astype(np.float32),
-      )
-
-    head = obs['sensor_data']['fetch_head']['depth'].float() / self._max_depth  # [N, H, W, 1]
-    hand = obs['sensor_data']['fetch_hand']['depth'].float() / self._max_depth
-
-    if self._num_frames == 1:
-      head_out = head[..., 0:1]  # [N, H, W, 1]
-      hand_out = hand[..., 0:1]
-    else:
-      self._depth_head_buf[..., self._depth_stack_ptr] = head
-      self._depth_hand_buf[..., self._depth_stack_ptr] = hand
-      self._depth_stack_ptr = (self._depth_stack_ptr + 1) % self._num_frames
-      head_stacked = self._depth_head_buf.roll(shifts=-self._depth_stack_ptr, dims=-1)
-      hand_stacked = self._depth_hand_buf.roll(shifts=-self._depth_stack_ptr, dims=-1)
-      N, H, W, C, F = head_stacked.shape
-      head_out = head_stacked.reshape(N, H, W, C * F)  # [N, H, W, num_frames]
-      hand_out = hand_stacked.reshape(N, H, W, C * F)
-
-    def to_uint8(t):
-      return (t.clamp(0, 1).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-
-    return to_uint8(head_out), to_uint8(hand_out)
+    # Depth is int16 mm from ManiSkill; /10000 maps ~10 m to 1.0 (indoor scene scale).
+    def _to_hwc(t):
+      t = t.permute(0, 2, 3, 1).contiguous().float() / self._max_depth
+      return t.clamp(0.0, 1.0)
+    head = _to_hwc(obs['fetch_head_depth'])
+    hand = _to_hwc(obs['fetch_hand_depth'])
+    return (
+        head.cpu().numpy().astype(np.float32),
+        hand.cpu().numpy().astype(np.float32),
+    )
 
   def _stack_frames(self, obs):
     """Return uint8 image [N, H, W, C*num_frames] in channels-last layout."""
