@@ -58,12 +58,12 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 unset XLA_PYTHON_CLIENT_MEM_FRACTION
 
-python -m dreamerv3.main \
-  --configs maniskill_rgb hawkes \
-  --task maniskill_PushCube-v1 \
-  --run.steps 1e6 \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/PushCube \
-  --logger.wandb_name hawkes-dreamerv3-PushCube
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_PushCube-v1 \
+#   --run.steps 1e6 \
+#   --logdir $HOME/logdir/maniskill/$TIMESTAMP/PushCube \
+#   --logger.wandb_name hawkes-dreamerv3-PushCube
 
 python -m dreamerv3.main \
   --configs maniskill_rgb hawkes \
