@@ -303,7 +303,7 @@ mshab:
       eval_max_episode_steps: 200   # matches mshab/configs/sac_pick.yml eval horizon
       frame_stack: 1                # no MSHab FrameStack; RSSM provides temporal context
   replay:
-    size: 1000000
+    size: 800000
 
 behavior1k:
   <<: *size100m

@@ -225,14 +225,20 @@ class Encoder(nj.Module):
 
     if self.imgkeys:
       K = self.kernel
-      imgs = [obs[k] for k in sorted(self.imgkeys)]
-      # Standard image path: uint8 in [0, 255] → normalise to [-0.5, 0.5].
-      # Float path (e.g. MSHab depth already scaled to [0, 1] by the wrapper):
-      # just shift the mean.
-      if all(x.dtype == jnp.uint8 for x in imgs):
-        x = nn.cast(jnp.concatenate(imgs, -1), force=True) / 255 - 0.5
-      else:
-        x = nn.cast(jnp.concatenate(imgs, -1), force=True) - 0.5
+      # Normalise each image to [0, 1] before concatenation so RGB (uint8,
+      # max 255) and depth (uint16, max self.obs_space[k].high in mm) can
+      # coexist. The final `- 0.5` shifts the input to roughly zero mean.
+      norm_imgs = []
+      for k in sorted(self.imgkeys):
+        v = obs[k]
+        if v.dtype == jnp.uint8:
+          scale = 255.0
+        elif v.dtype == jnp.uint16:
+          scale = float(np.asarray(self.obs_space[k].high).max())
+        else:
+          scale = 1.0
+        norm_imgs.append(nn.cast(v, force=True) / scale)
+      x = jnp.concatenate(norm_imgs, -1) - 0.5
       x = x.reshape((-1, *x.shape[bdims:]))
       for i, depth in enumerate(self.depths):
         if self.outer and i == 0:

@@ -251,10 +251,14 @@ class ManiSkill(embodied.Env):
     if 'rgb' in self._obs_mode:
       spaces['image'] = elements.Space(np.uint8, self._img_shape)
     if self._obs_mode == 'depth':
+      # Store raw millimetres as uint16 to match MSHab's SAC replay buffer
+      # (mshab/mshab/agents/sac/replay.py). This is 4x smaller than float32
+      # and 2x larger than uint8 but lossless at 1 mm precision.
+      hi = int(self._max_depth)
       spaces['depth_head'] = elements.Space(
-          np.float32, self._depth_shape, 0.0, 1.0)
+          np.uint16, self._depth_shape, 0, hi)
       spaces['depth_hand'] = elements.Space(
-          np.float32, self._depth_shape, 0.0, 1.0)
+          np.uint16, self._depth_shape, 0, hi)
     return spaces
 
   @property
@@ -374,16 +378,16 @@ class ManiSkill(embodied.Env):
     return torch.cat(parts, dim=-1).cpu().float().numpy()
 
   def _extract_depth(self, obs):
-    # Depth is int16 mm from ManiSkill; /10000 maps ~10 m to 1.0 (indoor scene scale).
-    def _to_hwc(t):
-      t = t.permute(0, 2, 3, 1).contiguous().float() / self._max_depth
-      return t.clamp(0.0, 1.0)
-    head = _to_hwc(obs['fetch_head_depth'])
-    hand = _to_hwc(obs['fetch_hand_depth'])
-    return (
-        head.cpu().numpy().astype(np.float32),
-        hand.cpu().numpy().astype(np.float32),
-    )
+    # Depth from ManiSkill is int16 millimetres in [N, 1, H, W]. Mirror MSHab's
+    # SAC pipeline: keep raw mm and store as uint16 (clamped to [0, max_depth]).
+    # Normalisation to [0, 1] happens inside the encoder/decoder, not here.
+    import torch
+    hi = int(self._max_depth)
+    def _to_uint16(t):
+      t = t.permute(0, 2, 3, 1).contiguous()
+      t = torch.clamp(t, 0, hi)
+      return t.to(torch.int32).cpu().numpy().astype(np.uint16)
+    return _to_uint16(obs['fetch_head_depth']), _to_uint16(obs['fetch_hand_depth'])
 
   def _stack_frames(self, obs):
     """Return uint8 image [N, H, W, C*num_frames] in channels-last layout."""

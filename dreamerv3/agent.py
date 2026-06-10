@@ -19,7 +19,7 @@ sg = lambda xs, skip=False: xs if skip else jax.lax.stop_gradient(xs)
 sample = lambda xs: jax.tree.map(lambda x: x.sample(nj.seed()), xs)
 prefix = lambda xs, p: {f'{p}/{k}': v for k, v in xs.items()}
 concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
-isimage = lambda s: s.dtype == np.uint8 and len(s.shape) == 3
+isimage = lambda s: s.dtype in (np.uint8, np.uint16) and len(s.shape) == 3
 
 
 class Agent(embodied.jax.Agent):
@@ -197,7 +197,12 @@ class Agent(embodied.jax.Agent):
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
-      target = f32(value) / 255 if isimage(space) else value
+      if isimage(space):
+        scale = 255.0 if space.dtype == np.uint8 else float(
+            np.asarray(space.high).max())
+        target = f32(value) / scale
+      else:
+        target = value
       losses[key] = recon.loss(sg(target))
 
     B, T = reset.shape
@@ -325,15 +330,17 @@ class Agent(embodied.jax.Agent):
       return x[..., :3]
 
     for key in self.dec.imgkeys:
-      assert obs[key].dtype in (jnp.uint8, jnp.float32)
+      space = self.obs_space[key]
+      assert obs[key].dtype in (jnp.uint8, jnp.uint16)
       true = obs[key][:RB]
       pred = jnp.concatenate([obsrecons[key].pred(), imgrecons[key].pred()], 1)
-      if true.dtype == jnp.uint8:
-        pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
-      else:
-        # Float depth (already in [0, 1] via wrapper /max_depth) → scale up.
-        true = jnp.clip(true * 255, 0, 255).astype(jnp.uint8)
-        pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
+      # `pred` is the decoder's sigmoid output in [0, 1] regardless of dtype.
+      pred = jnp.clip(pred * 255, 0, 255).astype(jnp.uint8)
+      if true.dtype == jnp.uint16:
+        # uint16 depth in mm → rescale by space.high before quantising to uint8.
+        hi = float(np.asarray(space.high).max())
+        true = jnp.clip(true.astype(jnp.float32) * (255.0 / hi),
+                        0, 255).astype(jnp.uint8)
       true = to_report_rgb(true)
       pred = to_report_rgb(pred)
       error = ((i32(pred) - i32(true) + 255) / 2).astype(np.uint8)
