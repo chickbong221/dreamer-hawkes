@@ -77,6 +77,7 @@ defaults:
     eval_eps: 1
     eval_freq: 50000
     eval_video_freq: 0
+    eval_reconfiguration_frequency: 1
     report_batches: 1
     from_checkpoint: ''
     episode_timeout: 180
@@ -257,7 +258,7 @@ maniskill_rgb:
     envs: 1
     eval_envs: 4
     eval_eps: 1
-    eval_freq: 20000
+    eval_freq: 50000
     eval_video_freq: 1000000
     train_ratio: 64.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
@@ -290,12 +291,14 @@ maniskill_rgb:
       num_frames: 1          # no frame stacking → 3 channels input to CNN
 
 mshab:
-  <<: *size200m
+  <<: *size100m
   batch_size: 32
   run:
     steps: 10e6
-    eval_eps: 1                # 4 eval episodes per eval_envs
-    report_every: 36000
+    eval_envs: 63
+    eval_eps: 1
+    eval_reconfiguration_frequency: 0   # matches SAC eval: fixed scene set, no reconfigure per reset
+    report_every: 72000
   env:
     maniskill:
       obs_mode: depth
