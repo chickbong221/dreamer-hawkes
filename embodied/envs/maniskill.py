@@ -38,7 +38,7 @@ class ManiSkill(embodied.Env):
       mshab_split='train',
       mshab_obj='all',
       nonprivileged_obs=False,
-      max_depth=15000.0,
+      max_depth=20000.0,
       max_episode_steps=None,
       eval_max_episode_steps=None,
       frame_stack=1,
