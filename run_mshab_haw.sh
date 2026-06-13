@@ -69,7 +69,7 @@ python -m dreamerv3.main \
   --task maniskill_PlaceSubtaskTrain-v0 \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
-  --logger.wandb_name hawkes-dreamerv3-mshab-place-set-table-200m
+  --logger.wandb_name hawkes-dreamerv3-mshab-place-set-table
 
 python -m dreamerv3.main \
   --configs maniskill_rgb  mshab hawkes \

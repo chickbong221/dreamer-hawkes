@@ -269,7 +269,8 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
 
         if do_video and hasattr(eval_env, 'render'):
           try:
-            video_frames.append(eval_env.render())
+            frame = np.asarray(eval_env.render())
+            video_frames.append(frame[:4].copy())
           except Exception as exc:
             if t == 0:
               print(f'Could not render eval video frames: {exc}')
