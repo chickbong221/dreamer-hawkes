@@ -1,7 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=dreamerv3-ms-haw
 #SBATCH --partition=main
-#SBATCH --nodelist=worker-1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
