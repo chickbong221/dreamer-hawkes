@@ -130,6 +130,14 @@ class Agent(embodied.jax.Agent):
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
+    # Surface Hawkes per-step features so the post-train event logger
+    # (dreamerv3/log_event_episode.py) can capture them. Gated on mode='eval'
+    # because the train-mode driver feeds `outs` into the replay buffer,
+    # and the train assertion `data.keys() == self.spaces.keys()` rejects
+    # any extra fields. eval-mode outs are consumed locally and discarded.
+    if self.config.dyn.typ == 'hawkes' and mode == 'eval':
+      out['haw_logit'] = feat['haw_logit']
+      out['haw_lam'] = feat['haw_lam']
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(

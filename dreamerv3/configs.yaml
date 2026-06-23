@@ -78,6 +78,11 @@ defaults:
     eval_freq: 50000
     eval_video_freq: 0
     eval_reconfiguration_frequency: 1
+    # One-shot post-training rollout that logs the Hawkes event posterior +
+    # input frames + per-phase table to W&B under event/. Off by default;
+    # turned on by the hawkes / hawkes_supervised presets below.
+    post_train_event_log: False
+    event_log_max_steps: 0  # 0 → fall back to env.maniskill.max_episode_steps
     report_batches: 1
     from_checkpoint: ''
     episode_timeout: 180
@@ -350,9 +355,13 @@ hawkes:
     dyn:
       typ: hawkes
       hawkes: {num_events: 8, haw_kl_balance: 0.1, haw_use_supervision: False}
+  run:
+    post_train_event_log: True
 
 hawkes_supervised:
   agent:
     dyn:
       typ: hawkes
       hawkes: {num_events: 3, haw_kl_balance: 0.1, haw_use_supervision: True}
+  run:
+    post_train_event_log: True

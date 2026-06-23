@@ -438,6 +438,25 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
 
   cp.save()
 
+  # Post-training: one-shot Hawkes event-episode logger (opt-in).
+  if bool(_arg('post_train_event_log', False)):
+    try:
+      from dreamerv3.log_event_episode import log_event_episode
+      dyn_typ = getattr(getattr(agent, 'config', None), 'dyn', None)
+      dyn_typ = getattr(dyn_typ, 'typ', None) if dyn_typ is not None else None
+      if dyn_typ == 'hawkes':
+        env_cfg = dict(agent.config.env.get('maniskill', {})) \
+            if hasattr(agent, 'config') else {}
+        # event_log_max_steps overrides; 0 → fall back to env max_episode_steps.
+        ep_steps = int(_arg('event_log_max_steps', 0)) or \
+            int(env_cfg.get('max_episode_steps') or 0) or 100
+        # max_depth: None → log_event_episode reads it from env._max_depth.
+        log_event_episode(agent, make_env, step, max_steps=ep_steps)
+      else:
+        print(f'[event-episode] dyn.typ={dyn_typ!r} — skipping post-train log.')
+    except Exception as exc:
+      print(f'[event-episode] post-train logging failed: {exc}')
+
   if eval_env is not None:
     eval_env.close()
   driver.close()
