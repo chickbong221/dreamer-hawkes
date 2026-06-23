@@ -445,11 +445,8 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       dyn_typ = getattr(getattr(agent, 'config', None), 'dyn', None)
       dyn_typ = getattr(dyn_typ, 'typ', None) if dyn_typ is not None else None
       if dyn_typ == 'hawkes':
-        env_cfg = dict(agent.config.env.get('maniskill', {})) \
-            if hasattr(agent, 'config') else {}
-        # event_log_max_steps overrides; 0 → fall back to env max_episode_steps.
-        ep_steps = int(_arg('event_log_max_steps', 0)) or \
-            int(env_cfg.get('max_episode_steps') or 0) or 100
+        # 0 → log_event_episode reads horizon from env._max_episode_steps.
+        ep_steps = int(_arg('event_log_max_steps', 0))
         # max_depth: None → log_event_episode reads it from env._max_depth.
         log_event_episode(agent, make_env, step, max_steps=ep_steps)
       else:

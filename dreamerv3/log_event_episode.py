@@ -209,14 +209,14 @@ def _rollout(agent, env, max_steps):
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def log_event_episode(agent, make_env, step, max_steps=100, max_depth=None):
+def log_event_episode(agent, make_env, step, max_steps=0, max_depth=None):
   """Roll out one episode, log per-step events + frames + phases to wandb.
 
   Args:
     agent: trained dreamerv3 Agent (Hawkes dynamics required).
     make_env: bound make_env(index, **overrides) — creates a fresh env.
     step: current global training step, used as the wandb log step.
-    max_steps: episode horizon to allocate.
+    max_steps: episode horizon to allocate. 0 → read env._max_episode_steps.
     max_depth: depth max value (mm) for u16 → u8 conversion. If None, read
       from env._max_depth (the actual configured value).
   """
@@ -238,6 +238,8 @@ def log_event_episode(agent, make_env, step, max_steps=100, max_depth=None):
   env = make_env(0, num_envs=1, is_eval=False)
   if max_depth is None:
     max_depth = float(getattr(env, '_max_depth', 20000.0))
+  if not max_steps or int(max_steps) <= 0:
+    max_steps = int(getattr(env, '_max_episode_steps', 100) or 100)
   try:
     data = _rollout(agent, env, max_steps)
   finally:

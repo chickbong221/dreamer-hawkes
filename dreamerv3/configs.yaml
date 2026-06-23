@@ -295,6 +295,42 @@ maniskill_rgb:
       control_mode: pd_joint_delta_pos
       num_frames: 1          # no frame stacking → 3 channels input to CNN
 
+maniskill_state:
+  <<: *size100m
+  run:
+    envs: 1
+    eval_envs: 4
+    eval_eps: 1
+    eval_freq: 50000
+    eval_video_freq: 1000000
+    train_ratio: 512.0   # higher than rgb: no CNN encoder cost
+    steps: 2e6
+    log_every: 1500
+    save_every: 50000
+    report_every: 7200
+  batch_size: 16
+  batch_length: 64
+  replay_context: 1
+  replay:
+    size: 1000000
+    online: true
+    fracs: {uniform: 1.0, priority: 0.0, recency: 0.0}
+  jax:
+    prealloc: false     # critical: ManiSkill and JAX share GPU
+  logger:
+    outputs: [wandb]
+    wandb_project: maniskill
+    wandb_entity: letuanhf-hanoi-university-of-science-and-technology
+    wandb_group: na
+    wandb_name: 'dreamerv3-maniskill-state'
+  env:
+    maniskill:
+      use_seed: true
+      num_envs: 189
+      obs_mode: state_base
+      sim_backend: gpu
+      control_mode: pd_joint_delta_pos
+
 mshab:
   <<: *size100m
   batch_size: 32
