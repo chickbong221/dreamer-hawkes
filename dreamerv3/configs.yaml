@@ -327,7 +327,7 @@ maniskill_state:
     maniskill:
       use_seed: true
       num_envs: 189
-      obs_mode: state_base
+      obs_mode: state
       sim_backend: gpu
       control_mode: pd_joint_delta_pos
 
