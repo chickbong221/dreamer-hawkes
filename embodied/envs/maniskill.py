@@ -173,6 +173,7 @@ class ManiSkill(embodied.Env):
 
     # Warm reset to discover obs/act shapes.
     obs, _ = self._env.reset(seed=seed)
+    obs = self._obs_to_dict(obs)
     self._setup_spaces(obs)
 
     if 'rgb' in obs_mode and self._num_frames > 1:
@@ -286,6 +287,7 @@ class ManiSkill(embodied.Env):
     if reset_mask.any():
       reset_idx = torch.tensor(np.where(reset_mask)[0], device=self._device)
       obs, _ = self._env.reset(options={'env_idx': reset_idx})
+      obs = self._obs_to_dict(obs)
 
       if 'rgb' in self._obs_mode and self._num_frames > 1:
         rgb = obs['rgb'].float() / 255.0
@@ -314,12 +316,13 @@ class ManiSkill(embodied.Env):
         np.asarray(action['action']), dtype=torch.float32, device=self._device)
 
     obs, reward, terminated, truncated, info = self._env.step(act)
+    obs = self._obs_to_dict(obs)
     done = (terminated | truncated).cpu().numpy().astype(bool)  # [N]
 
     # Replace obs with final_observation for done envs so the replay/eval code
     # sees the true last state, mirroring TD-MPC2 online_trainer.py.
     if done.any() and 'final_observation' in info:
-      final = info['final_observation']
+      final = self._obs_to_dict(info['final_observation'])
       done_t = torch.tensor(done, dtype=torch.bool, device=self._device)
       for key in obs:
         if key in final and isinstance(obs[key], torch.Tensor):
@@ -360,6 +363,14 @@ class ManiSkill(embodied.Env):
   # ------------------------------------------------------------------ #
   #  Internal helpers
   # ------------------------------------------------------------------ #
+
+  def _obs_to_dict(self, obs):
+    # obs_mode='state' makes ManiSkill return a flat Tensor instead of a dict.
+    # Wrap it so the rest of this class can treat obs uniformly as a mapping.
+    import torch
+    if isinstance(obs, torch.Tensor):
+      return {'state': obs}
+    return obs
 
   def _extract_state(self, obs):
     """Concatenate ManiSkill proprioceptive obs into [N, D] float32."""
