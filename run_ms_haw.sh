@@ -63,7 +63,7 @@ unset XLA_PYTHON_CLIENT_MEM_FRACTION
 python -m dreamerv3.main \
   --configs maniskill_state hawkes \
   --task maniskill_PushCube-v1 \
-  --run.steps 1e6 \
+  --run.steps 4e6 \
   --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PushCube-sparse \
   --env.maniskill.reward_mode sparse \
   --logger.wandb_name hawkes-dreamerv3-state-PushCube-sparse
@@ -71,7 +71,7 @@ python -m dreamerv3.main \
 python -m dreamerv3.main \
   --configs maniskill_state hawkes \
   --task maniskill_PickCube-v1 \
-  --run.steps 1e6 \
+  --run.steps 8e6 \
   --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PickCube-sparse \
   --env.maniskill.reward_mode sparse \
   --logger.wandb_name hawkes-dreamerv3-state-PickCube-sparse
@@ -95,7 +95,7 @@ python -m dreamerv3.main \
 python -m dreamerv3.main \
   --configs maniskill_state hawkes \
   --task maniskill_PushT-v1 \
-  --run.steps 2e6 \
+  --run.steps 4e6 \
   --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PushT-sparse \
   --env.maniskill.reward_mode sparse \
   --logger.wandb_name hawkes-dreamerv3-state-PushT-sparse
@@ -103,7 +103,7 @@ python -m dreamerv3.main \
 python -m dreamerv3.main \
   --configs maniskill_state hawkes \
   --task maniskill_AnymalC-Reach-v1 \
-  --run.steps 2e6 \
+  --run.steps 4e6 \
   --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/AnymalC-Reach-sparse \
   --env.maniskill.reward_mode sparse \
   --logger.wandb_name hawkes-dreamerv3-state-AnymalC-Reach-sparse
@@ -111,7 +111,7 @@ python -m dreamerv3.main \
 python -m dreamerv3.main \
   --configs maniskill_state hawkes \
   --task maniskill_UnitreeG1TransportBox-v1 \
-  --run.steps 2e6 \
+  --run.steps 4e6 \
   --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/UnitreeG1TransportBox-sparse \
   --env.maniskill.reward_mode sparse \
   --logger.wandb_name hawkes-dreamerv3-state-UnitreeG1TransportBox-sparse
@@ -129,7 +129,7 @@ python -m dreamerv3.main \
 python -m dreamerv3.main \
   --configs maniskill_state hawkes \
   --task maniskill_PickCube-v1 \
-  --run.steps 1e6 \
+  --run.steps 2e6 \
   --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PickCube-dense \
   --env.maniskill.reward_mode normalized_dense \
   --logger.wandb_name hawkes-dreamerv3-state-PickCube-dense
