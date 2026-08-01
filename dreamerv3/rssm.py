@@ -201,6 +201,30 @@ class Encoder(nj.Module):
   def entry_space(self):
     return {}
 
+  @property
+  def output_size(self):
+    """Flattened width of the encoder tokens returned by ``__call__``."""
+    size = 0
+    if self.veckeys:
+      if self.layers:
+        size += self.units
+      else:
+        size += sum(int(np.prod(self.obs_space[k].shape)) for k in self.veckeys)
+    if self.imgkeys:
+      shapes = [self.obs_space[k].shape[:2] for k in self.imgkeys]
+      assert all(shape == shapes[0] for shape in shapes), shapes
+      height, width = shapes[0]
+      for i in range(len(self.depths)):
+        if self.outer and i == 0:
+          continue
+        if self.strided:
+          height, width = (height + 1) // 2, (width + 1) // 2
+        else:
+          assert height % 2 == 0 and width % 2 == 0, (height, width)
+          height, width = height // 2, width // 2
+      size += height * width * self.depths[-1]
+    return size
+
   def initial(self, batch_size):
     return {}
 
@@ -257,6 +281,8 @@ class Encoder(nj.Module):
 
     x = jnp.concatenate(outs, -1)
     tokens = x.reshape((*bshape, *x.shape[1:]))
+    assert tokens.shape[-1] == self.output_size, (
+        tokens.shape, self.output_size)
     entries = {}
     return carry, entries, tokens
 

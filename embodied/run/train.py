@@ -45,6 +45,9 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
   eval_video_freq = int(float(_arg('eval_video_freq', 0)))
   eval_num_envs = int(_arg('eval_envs', 4))
   eval_episodes_per_env = max(int(_arg('eval_eps', 1)), 1)
+  dyn_config = getattr(getattr(agent, 'config', None), 'dyn', None)
+  dyn_type = getattr(dyn_config, 'typ', None)
+  eval_event_log = bool(_arg('eval_event_log', False)) and dyn_type == 'hawkes'
 
   # ManiSkill episode-level metrics that TD-MPC2 logs once per completed
   # training vector episode batch as mean over cfg.num_envs.
@@ -255,8 +258,11 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     horizon = int(getattr(eval_env, '_max_episode_steps', 10000))
     all_metrics = collections.defaultdict(list)
     video_frames = []
+    # Filled only from episode 0, environment index 0. This reuses the
+    # existing evaluation rollout and never creates an event-specific env.
+    event_data = collections.defaultdict(list) if eval_event_log else None
 
-    for _ in range(eval_episodes_per_env):
+    for eval_episode_idx in range(eval_episodes_per_env):
       carry = agent.init_policy(eval_num_envs)
       acts = _zero_actions(eval_env, eval_num_envs)
       fallback_return = np.zeros(eval_num_envs, np.float32)
@@ -305,6 +311,17 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
         assert all(k not in acts for k in outs), (
             list(outs.keys()), list(acts.keys()))
 
+        if event_data is not None and eval_episode_idx == 0 and \
+           'haw_logit' in outs:
+          for key in ('haw_logit', 'haw_lam', 'haw_gate'):
+            event_data[key].append(_to_numpy(outs[key])[0].copy())
+          event_data['reward'].append(float(obs['reward'][0]))
+          if 'action' in acts:
+            event_data['action'].append(_to_numpy(acts['action'])[0].copy())
+          for key in ('depth_head', 'depth_hand'):
+            if key in obs:
+              event_data[key].append(obs[key][0].copy())
+
         if done.any():
           mask = ~done
           acts = {k: _mask(v, mask) for k, v in acts.items()}
@@ -326,8 +343,20 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     })
 
     # TD-MPC2 Logger.log(eval_metrics, 'eval') writes eval/<key> and uses
-    # W&B step=d['step']. Do this directly to W&B as requested.
-    _wandb_log_direct({f'eval/{k}': v for k, v in eval_metrics.items()}, step)
+    # W&B step=d['step']. Merge event panels into this same call so all media
+    # from an evaluation phase shares one W&B step.
+    eval_payload = {f'eval/{k}': v for k, v in eval_metrics.items()}
+    if event_data:
+      try:
+        from dreamerv3.log_event_episode import build_event_episode_payload
+        captured = {key: np.asarray(values)
+                    for key, values in event_data.items()}
+        max_depth = float(getattr(eval_env, '_max_depth', 20000.0))
+        eval_payload.update(build_event_episode_payload(
+            agent, captured, max_depth=max_depth))
+      except Exception as exc:
+        print(f'[event-episode] eval logging failed: {exc}')
+    _wandb_log_direct(eval_payload, step)
 
     if do_video:
       _log_wandb_eval_video(video_frames, step, fps=15,
@@ -437,22 +466,6 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       logger.write()
 
   cp.save()
-
-  # Post-training: one-shot Hawkes event-episode logger (opt-in).
-  if bool(_arg('post_train_event_log', False)):
-    try:
-      from dreamerv3.log_event_episode import log_event_episode
-      dyn_typ = getattr(getattr(agent, 'config', None), 'dyn', None)
-      dyn_typ = getattr(dyn_typ, 'typ', None) if dyn_typ is not None else None
-      if dyn_typ == 'hawkes':
-        # 0 → log_event_episode reads horizon from env._max_episode_steps.
-        ep_steps = int(_arg('event_log_max_steps', 0))
-        # max_depth: None → log_event_episode reads it from env._max_depth.
-        log_event_episode(agent, make_env, step, max_steps=ep_steps)
-      else:
-        print(f'[event-episode] dyn.typ={dyn_typ!r} — skipping post-train log.')
-    except Exception as exc:
-      print(f'[event-episode] post-train logging failed: {exc}')
 
   if eval_env is not None:
     eval_env.close()

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dreamerv3-ms
+#SBATCH --job-name=dreamerv3-mshab-rgb-haw
 #SBATCH --partition=main
 #SBATCH --nodelist=worker-1
 #SBATCH --gres=gpu:1
@@ -64,72 +64,80 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 unset XLA_PYTHON_CLIENT_MEM_FRACTION
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb  mshab hawkes \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/place-set-table \
+  --configs maniskill_rgb mshab hawkes \
+  --logdir $HOME/logdir/mshab_rgb/$TIMESTAMP/place-set-table \
   --task maniskill_PlaceSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
-  --logger.wandb_name hawkes-dreamerv3-mshab-place-set-table
+  --logger.wandb_name hawkes-dreamerv3-mshab-rgb-place-set-table
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb  mshab hawkes \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/open-set-table-kitchen-counter \
+  --configs maniskill_rgb mshab hawkes \
+  --logdir $HOME/logdir/mshab_rgb/$TIMESTAMP/open-set-table-kitchen-counter \
   --task maniskill_OpenSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
   --env.maniskill.mshab_obj kitchen_counter \
-  --logger.wandb_name hawkes-dreamerv3-mshab-open-set-table-kitchen-counter
+  --logger.wandb_name hawkes-dreamerv3-mshab-rgb-open-set-table-kitchen-counter
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb  mshab hawkes \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/open-set-table-fridge \
+  --configs maniskill_rgb mshab hawkes \
+  --logdir $HOME/logdir/mshab_rgb/$TIMESTAMP/open-set-table-fridge \
   --task maniskill_OpenSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
   --env.maniskill.mshab_obj fridge \
-  --logger.wandb_name hawkes-dreamerv3-mshab-open-set-table-fridge
+  --logger.wandb_name hawkes-dreamerv3-mshab-rgb-open-set-table-fridge
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb  mshab hawkes \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/close-set-table-kitchen-counter \
+  --configs maniskill_rgb mshab hawkes \
+  --logdir $HOME/logdir/mshab_rgb/$TIMESTAMP/close-set-table-kitchen-counter \
   --task maniskill_CloseSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
   --env.maniskill.mshab_obj kitchen_counter \
-  --logger.wandb_name hawkes-dreamerv3-mshab-close-set-table-kitchen-counter
+  --logger.wandb_name hawkes-dreamerv3-mshab-rgb-close-set-table-kitchen-counter
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb  mshab hawkes \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/close-set-table-fridge \
+  --configs maniskill_rgb mshab hawkes \
+  --logdir $HOME/logdir/mshab_rgb/$TIMESTAMP/close-set-table-fridge \
   --task maniskill_CloseSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
   --env.maniskill.mshab_obj fridge \
-  --logger.wandb_name hawkes-dreamerv3-mshab-close-set-table-fridge
+  --logger.wandb_name hawkes-dreamerv3-mshab-rgb-close-set-table-fridge
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb  mshab hawkes \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/navigate-tidy-house \
+  --configs maniskill_rgb mshab hawkes \
+  --logdir $HOME/logdir/mshab_rgb/$TIMESTAMP/navigate-tidy-house \
   --task maniskill_NavigateSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task tidy_house \
-  --logger.wandb_name hawkes-dreamerv3-mshab-navigate-tidy-house
+  --logger.wandb_name hawkes-dreamerv3-mshab-rgb-navigate-tidy-house
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb  mshab hawkes \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/navigate-prepare-groceries \
+  --configs maniskill_rgb mshab hawkes \
+  --logdir $HOME/logdir/mshab_rgb/$TIMESTAMP/navigate-prepare-groceries \
   --task maniskill_NavigateSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task prepare_groceries \
-  --logger.wandb_name hawkes-dreamerv3-mshab-navigate-prepare-groceries
+  --logger.wandb_name hawkes-dreamerv3-mshab-rgb-navigate-prepare-groceries
 
 python -m dreamerv3.main \
-  --configs maniskill_rgb  mshab hawkes \
-  --logdir $HOME/logdir/maniskill/$TIMESTAMP/navigate-set-table \
+  --configs maniskill_rgb mshab hawkes \
+  --logdir $HOME/logdir/mshab_rgb/$TIMESTAMP/navigate-set-table \
   --task maniskill_NavigateSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
   --env.maniskill.control_mode pd_joint_delta_pos \
   --env.maniskill.mshab_task set_table \
-  --logger.wandb_name hawkes-dreamerv3-mshab-navigate-set-table
+  --logger.wandb_name hawkes-dreamerv3-mshab-rgb-navigate-set-table
 
 # Stop GPU monitor
 kill $GPU_MONITOR_PID

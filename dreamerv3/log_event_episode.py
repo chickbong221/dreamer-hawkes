@@ -1,17 +1,14 @@
 """
-Post-training event-episode logger.
+Evaluation event-episode visualizer.
 
-Rolls out one fresh episode through the trained Hawkes agent on a single
-training-style env, captures the per-step Hawkes posterior over K event
-categories alongside the raw input frames, and logs everything to W&B under
-the `event/` namespace.
-
-Expected runtime: ~1 episode = `max_episode_steps` steps on a 1-wide
-ManiSkillVectorEnv. Compute is negligible compared to a training run.
+Builds W&B panels from the first episode of evaluation environment index 0.
+The evaluation loop supplies already-collected Hawkes features and observation
+frames, so this module never creates an environment or runs an extra rollout.
 
 Outputs to wandb (all under `event/`):
   event/post_probs        — [K, T] heatmap of softmax posterior per step
   event/lambda            — [K, T] heatmap of Hawkes intensities per step
+  event/gate_activity     — [K, T] heatmap of GateL0RD update activity
   event/argmax_trace      — [1, T] colored strip, color = argmax category id
   event/argmax_per_step   — line plot of argmax category id over time
   event/reward_trace      — line plot of reward over time
@@ -25,7 +22,6 @@ Outputs to wandb (all under `event/`):
 """
 
 import io
-from collections import defaultdict
 
 import numpy as np
 
@@ -156,104 +152,45 @@ def _fetch_hawkes_params(agent):
 
 
 # ---------------------------------------------------------------------------
-# Rollout
-# ---------------------------------------------------------------------------
-
-def _rollout(agent, env, max_steps):
-  """Run one episode with N=1 envs; capture per-step features and obs.
-
-  Returns a dict of numpy arrays keyed by step (concatenated along time).
-  """
-  obs_keys = list(env.obs_space.keys())
-  num_envs = env.num_envs
-  assert num_envs == 1, f'Expected single-env wrapper, got {num_envs}'
-
-  acts = {k: np.zeros((num_envs,) + v.shape, v.dtype)
-          for k, v in env.act_space.items()}
-  acts['reset'] = np.ones(num_envs, bool)
-
-  carry = agent.init_policy(num_envs)
-  buf = defaultdict(list)
-
-  # Per-iteration we capture frame + features TOGETHER, so every list in
-  # buf has the same length. On the terminal step the agent is not queried
-  # (episode is over), so we just break — that step is omitted.
-  for t in range(max_steps + 2):
-    obs = env.step(acts)
-    obs = {k: np.asarray(v) for k, v in obs.items()}
-
-    if t > 0 and bool(obs['is_last'][0]):
-      break
-
-    obs_for_policy = {k: v for k, v in obs.items() if not k.startswith('log/')}
-    carry, acts_out, outs = agent.policy(carry, obs_for_policy, mode='eval')
-
-    for k in ('depth_head', 'depth_hand'):
-      if k in obs:
-        buf[k].append(obs[k][0].copy())
-    if 'haw_logit' in outs:
-      buf['haw_logit'].append(np.asarray(outs['haw_logit'])[0].copy())
-      buf['haw_lam'].append(np.asarray(outs['haw_lam'])[0].copy())
-    buf['action'].append(np.asarray(acts_out['action'])[0].copy())
-    buf['reward'].append(float(obs['reward'][0]))
-
-    acts = {**acts_out, 'reset': np.zeros(num_envs, bool)}
-  else:
-    print(f'[event-episode] Warning: episode did not finish within '
-          f'{max_steps + 2} steps')
-
-  return {k: np.asarray(v) for k, v in buf.items()}
-
-
-# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def log_event_episode(agent, make_env, step, max_steps=0, max_depth=None):
-  """Roll out one episode, log per-step events + frames + phases to wandb.
+def build_event_episode_payload(agent, data, max_depth=None):
+  """Build event-assignment panels from an episode captured by evalfn().
 
   Args:
-    agent: trained dreamerv3 Agent (Hawkes dynamics required).
-    make_env: bound make_env(index, **overrides) — creates a fresh env.
-    step: current global training step, used as the wandb log step.
-    max_steps: episode horizon to allocate. 0 → read env._max_episode_steps.
-    max_depth: depth max value (mm) for u16 → u8 conversion. If None, read
-      from env._max_depth (the actual configured value).
+    agent: Dreamer agent with Hawkes dynamics.
+    data: arrays captured from evaluation environment index 0. Required keys
+      are haw_logit, haw_lam, haw_gate, and reward. Depth frames are optional.
+    max_depth: depth maximum in millimeters for uint16 visualization.
+
+  Returns:
+    A dict of W&B media objects ready to merge into the eval-step payload.
   """
   if getattr(agent, 'config', None) is None or \
      agent.config.dyn.typ != 'hawkes':
     print('[event-episode] dyn.typ != hawkes — skipping.')
-    return
+    return {}
 
   try:
     import wandb
   except ImportError:
     print('[event-episode] wandb not installed — skipping.')
-    return
+    return {}
   if wandb.run is None:
     print('[event-episode] no active wandb run — skipping.')
-    return
-
-  print('[event-episode] Building fresh 1-env wrapper for rollout...')
-  env = make_env(0, num_envs=1, is_eval=False)
-  if max_depth is None:
-    max_depth = float(getattr(env, '_max_depth', 20000.0))
-  if not max_steps or int(max_steps) <= 0:
-    max_steps = int(getattr(env, '_max_episode_steps', 100) or 100)
-  try:
-    data = _rollout(agent, env, max_steps)
-  finally:
-    try:
-      env.close()
-    except Exception as exc:
-      print(f'[event-episode] env.close raised: {exc}')
+    return {}
 
   if 'haw_logit' not in data or len(data['haw_logit']) == 0:
     print('[event-episode] No Hawkes features captured — skipping.')
-    return
+    return {}
+
+  data = {key: np.asarray(value) for key, value in data.items()}
+  max_depth = float(max_depth or 20000.0)
 
   haw_logit = data['haw_logit']                       # [T, K]
   haw_lam = data['haw_lam']                           # [T, K]
+  haw_gate = data['haw_gate']                         # [T, K]
   post_probs = _softmax(haw_logit, axis=-1)           # [T, K]
   argmax = post_probs.argmax(-1)                      # [T]
   T, K = post_probs.shape
@@ -276,6 +213,11 @@ def log_event_episode(agent, make_env, step, max_steps=0, max_depth=None):
   lam_rgb = _upscale(lam_rgb, target_h=K * 16, target_w=T * 6)
   payload['event/lambda'] = wandb.Image(
       lam_rgb, caption='Hawkes intensity λ_k(t), normalized per row')
+
+  gate_rgb = _viridis(haw_gate.T)
+  gate_rgb = _upscale(gate_rgb, target_h=K * 16, target_w=T * 6)
+  payload['event/gate_activity'] = wandb.Image(
+      gate_rgb, caption='GateL0RD hard update gates — rows=K, cols=t')
 
   # argmax strip: colored band, one column per timestep, color = category.
   palette = _category_palette(K)
@@ -359,13 +301,7 @@ def log_event_episode(agent, make_env, step, max_steps=0, max_depth=None):
     payload['event/mu'] = wandb.plot.bar(
         mu_table, 'k', 'mu', title='mu_k — baseline intensity per category')
 
-  # ---- Push to wandb --------------------------------------------------------
-  try:
-    wandb.log(payload, step=int(step))
-    print(f'[event-episode] Logged {len(payload)} panels to wandb '
-          f'(T={T}, K={K}, phases={len(phases)}).')
-  except Exception as exc:
-    print(f'[event-episode] wandb.log failed: {exc}')
+  return payload
 
 
 def _softmax(x, axis=-1):

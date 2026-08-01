@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=dreamerv3-ms-haw
+#SBATCH --job-name=dreamerv3-ms-rgb-haw
 #SBATCH --partition=main
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
@@ -58,121 +58,121 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 unset XLA_PYTHON_CLIENT_MEM_FRACTION
 
-# ── Sparse reward runs (all tasks) ────────────────────────────────────────────
+# # ── Sparse reward runs (all tasks) ────────────────────────────────────────────
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_PushCube-v1 \
-  --run.steps 4e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PushCube-sparse \
-  --env.maniskill.reward_mode sparse \
-  --logger.wandb_name hawkes-dreamerv3-state-PushCube-sparse
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_PushCube-v1 \
+#   --run.steps 4e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/PushCube-sparse \
+#   --env.maniskill.reward_mode sparse \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-PushCube-sparse
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_PickCube-v1 \
-  --run.steps 8e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PickCube-sparse \
-  --env.maniskill.reward_mode sparse \
-  --logger.wandb_name hawkes-dreamerv3-state-PickCube-sparse
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_PickCube-v1 \
+#   --run.steps 8e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/PickCube-sparse \
+#   --env.maniskill.reward_mode sparse \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-PickCube-sparse
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_StackCube-v1 \
-  --run.steps 4e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/StackCube-sparse \
-  --env.maniskill.reward_mode sparse \
-  --logger.wandb_name hawkes-dreamerv3-state-StackCube-sparse
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_StackCube-v1 \
+#   --run.steps 4e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/StackCube-sparse \
+#   --env.maniskill.reward_mode sparse \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-StackCube-sparse
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_PegInsertionSide-v1 \
-  --run.steps 4e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PegInsertionSide-sparse \
-  --env.maniskill.reward_mode sparse \
-  --logger.wandb_name hawkes-dreamerv3-state-PegInsertionSide-sparse
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_PegInsertionSide-v1 \
+#   --run.steps 4e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/PegInsertionSide-sparse \
+#   --env.maniskill.reward_mode sparse \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-PegInsertionSide-sparse
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_PushT-v1 \
-  --run.steps 4e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PushT-sparse \
-  --env.maniskill.reward_mode sparse \
-  --logger.wandb_name hawkes-dreamerv3-state-PushT-sparse
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_PushT-v1 \
+#   --run.steps 4e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/PushT-sparse \
+#   --env.maniskill.reward_mode sparse \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-PushT-sparse
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_AnymalC-Reach-v1 \
-  --run.steps 4e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/AnymalC-Reach-sparse \
-  --env.maniskill.reward_mode sparse \
-  --logger.wandb_name hawkes-dreamerv3-state-AnymalC-Reach-sparse
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_AnymalC-Reach-v1 \
+#   --run.steps 4e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/AnymalC-Reach-sparse \
+#   --env.maniskill.reward_mode sparse \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-AnymalC-Reach-sparse
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_UnitreeG1TransportBox-v1 \
-  --run.steps 4e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/UnitreeG1TransportBox-sparse \
-  --env.maniskill.reward_mode sparse \
-  --logger.wandb_name hawkes-dreamerv3-state-UnitreeG1TransportBox-sparse
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_UnitreeG1TransportBox-v1 \
+#   --run.steps 4e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/UnitreeG1TransportBox-sparse \
+#   --env.maniskill.reward_mode sparse \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-UnitreeG1TransportBox-sparse
 
 # ── Dense reward runs (all tasks) ─────────────────────────────────────────────
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_PushCube-v1 \
-  --run.steps 1e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PushCube-dense \
-  --env.maniskill.reward_mode normalized_dense \
-  --logger.wandb_name hawkes-dreamerv3-state-PushCube-dense
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_PushCube-v1 \
+#   --run.steps 1e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/PushCube-dense \
+#   --env.maniskill.reward_mode normalized_dense \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-PushCube-dense
+
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_PickCube-v1 \
+#   --run.steps 2e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/PickCube-dense \
+#   --env.maniskill.reward_mode normalized_dense \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-PickCube-dense
 
 python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_PickCube-v1 \
-  --run.steps 2e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PickCube-dense \
-  --env.maniskill.reward_mode normalized_dense \
-  --logger.wandb_name hawkes-dreamerv3-state-PickCube-dense
-
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
+  --configs maniskill_rgb hawkes \
   --task maniskill_StackCube-v1 \
   --run.steps 4e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/StackCube-dense \
+  --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/StackCube-dense \
   --env.maniskill.reward_mode normalized_dense \
-  --logger.wandb_name hawkes-dreamerv3-state-StackCube-dense
+  --logger.wandb_name hawkes-dreamerv3-rgb-StackCube-dense
 
 python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
+  --configs maniskill_rgb hawkes \
   --task maniskill_PegInsertionSide-v1 \
   --run.steps 4e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PegInsertionSide-dense \
+  --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/PegInsertionSide-dense \
   --env.maniskill.reward_mode normalized_dense \
-  --logger.wandb_name hawkes-dreamerv3-state-PegInsertionSide-dense
+  --logger.wandb_name hawkes-dreamerv3-rgb-PegInsertionSide-dense
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_PushT-v1 \
-  --run.steps 2e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/PushT-dense \
-  --env.maniskill.reward_mode normalized_dense \
-  --logger.wandb_name hawkes-dreamerv3-state-PushT-dense
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_PushT-v1 \
+#   --run.steps 2e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/PushT-dense \
+#   --env.maniskill.reward_mode normalized_dense \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-PushT-dense
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_AnymalC-Reach-v1 \
-  --run.steps 2e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/AnymalC-Reach-dense \
-  --env.maniskill.reward_mode normalized_dense \
-  --logger.wandb_name hawkes-dreamerv3-state-AnymalC-Reach-dense
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_AnymalC-Reach-v1 \
+#   --run.steps 2e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/AnymalC-Reach-dense \
+#   --env.maniskill.reward_mode normalized_dense \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-AnymalC-Reach-dense
 
-python -m dreamerv3.main \
-  --configs maniskill_state hawkes \
-  --task maniskill_UnitreeG1TransportBox-v1 \
-  --run.steps 2e6 \
-  --logdir $HOME/logdir/maniskill_state/$TIMESTAMP/UnitreeG1TransportBox-dense \
-  --env.maniskill.reward_mode normalized_dense \
-  --logger.wandb_name hawkes-dreamerv3-state-UnitreeG1TransportBox-dense
+# python -m dreamerv3.main \
+#   --configs maniskill_rgb hawkes \
+#   --task maniskill_UnitreeG1TransportBox-v1 \
+#   --run.steps 2e6 \
+#   --logdir $HOME/logdir/maniskill_rgb/$TIMESTAMP/UnitreeG1TransportBox-dense \
+#   --env.maniskill.reward_mode normalized_dense \
+#   --logger.wandb_name hawkes-dreamerv3-rgb-UnitreeG1TransportBox-dense
 
 # Stop GPU monitor
 kill $GPU_MONITOR_PID

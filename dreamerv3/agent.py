@@ -42,10 +42,17 @@ class Agent(embodied.jax.Agent):
     self.enc = {
         'simple': rssm.Encoder,
     }[config.enc.typ](enc_space, **config.enc[config.enc.typ], name='enc')
-    self.dyn = {
+    dyn_cls = {
         'rssm': rssm.RSSM,
         'hawkes': hawkes_rssm.HawkesRSSM,
-    }[config.dyn.typ](act_space, **config.dyn[config.dyn.typ], name='dyn')
+    }[config.dyn.typ]
+    if config.dyn.typ == 'hawkes':
+      self.dyn = dyn_cls(
+          act_space, obs_dim=self.enc.output_size,
+          **config.dyn[config.dyn.typ], name='dyn')
+    else:
+      self.dyn = dyn_cls(
+          act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
         'simple': rssm.Decoder,
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
@@ -130,7 +137,7 @@ class Agent(embodied.jax.Agent):
     out['finite'] = elements.tree.flatdict(jax.tree.map(
         lambda x: jnp.isfinite(x).all(range(1, x.ndim)),
         dict(obs=obs, carry=carry, tokens=tokens, feat=feat, act=act)))
-    # Surface Hawkes per-step features so the post-train event logger
+    # Surface Hawkes per-step features so the evaluation event logger
     # (dreamerv3/log_event_episode.py) can capture them. Gated on mode='eval'
     # because the train-mode driver feeds `outs` into the replay buffer,
     # and the train assertion `data.keys() == self.spaces.keys()` rejects
@@ -138,6 +145,7 @@ class Agent(embodied.jax.Agent):
     if self.config.dyn.typ == 'hawkes' and mode == 'eval':
       out['haw_logit'] = feat['haw_logit']
       out['haw_lam'] = feat['haw_lam']
+      out['haw_gate'] = feat['haw_gate']
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(

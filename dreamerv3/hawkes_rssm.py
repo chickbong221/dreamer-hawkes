@@ -64,6 +64,7 @@ class HawkesRSSM(nj.Module):
   free_nats: float = 1.0
 
   # --- Hawkes-specific hyperparameters --------------------------------------
+  obs_dim: int = 0                    # flattened encoder token width
   num_events: int = 8                # K
   haw_hidden: int = 256              # MLP_omega hidden width
   haw_embed: int = 128               # h_t dimensionality
@@ -73,10 +74,12 @@ class HawkesRSSM(nj.Module):
   haw_init_beta: float = 1.0         # beta init (decay over ~1 step)
   haw_init_mu: float = 0.1           # mu init (baseline intensity)
   haw_gumbel_tau: float = 1.0        # Gumbel-Softmax temperature
+  haw_gate_noise: float = 0.1        # GateL0RD Gaussian train-time noise
   haw_use_supervision: bool = False  # if True, expect privileged labels in extras
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
+    assert self.obs_dim > 0, self.obs_dim
     self.act_space = act_space
     self.kw = kw
 
@@ -95,14 +98,20 @@ class HawkesRSSM(nj.Module):
         haw_state=elements.Space(np.float32, (self.num_events, self.num_events)),
         # Last event distribution p_{t-1}, used by the recursion to add
         # alpha_{k, e_{t-1}} into S without committing to a hard sample.
-        haw_prev=elements.Space(np.float32, (self.num_events,)))
+        haw_prev=elements.Space(np.float32, (self.num_events,)),
+        # Previous encoder token for eps_t = enc(o_{t+1}) - enc(o_t).
+        haw_prev_obs=elements.Space(np.float32, (self.obs_dim,)),
+        # Recurrent GateL0RD state on the posterior event path.
+        haw_post_state=elements.Space(np.float32, (self.num_events,)))
 
   def initial(self, bsize):
     return nn.cast(dict(
         deter=jnp.zeros([bsize, self.deter], f32),
         stoch=jnp.zeros([bsize, self.stoch, self.classes], f32),
         haw_state=jnp.zeros([bsize, self.num_events, self.num_events], f32),
-        haw_prev=jnp.zeros([bsize, self.num_events], f32)))
+        haw_prev=jnp.zeros([bsize, self.num_events], f32),
+        haw_prev_obs=jnp.zeros([bsize, self.obs_dim], f32),
+        haw_post_state=jnp.zeros([bsize, self.num_events], f32)))
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
@@ -151,13 +160,34 @@ class HawkesRSSM(nj.Module):
     """Posterior q_t^pos(e_t | z_t, z_{t+1}, a_t, eps_t). Returns logits [B, K].
 
     `next_tokens` is the encoder output for x_{t+1} (the obs token).
-    `eps` is the per-batch prediction-surprise scalar [B, 1].
+    `eps` is the encoder-space observation delta [B, obs_dim].
     """
     x = jnp.concatenate([deter, next_tokens, action, eps], -1)
     for i in range(2):
       x = self.sub(f'pos{i}', nn.Linear, self.haw_hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'pos{i}norm', nn.Norm, self.norm)(x))
     return self.sub('poslogit', nn.Linear, self.num_events, **self.kw)(x)
+
+  def _gatel0rd_post(self, post_input, state, training):
+    """THICK-style GateL0RD update over posterior classifier output."""
+    x = jnp.concatenate([post_input, state], -1)
+    candidate = jnp.tanh(self.sub(
+        'post_gate_candidate', nn.Linear, self.num_events, **self.kw)(x))
+    gate_pre = self.sub(
+        'post_gate_update', nn.Linear, self.num_events, **self.kw)(x)
+    if training and self.haw_gate_noise:
+      noise = jax.random.normal(
+          nj.seed(), gate_pre.shape, dtype=gate_pre.dtype)
+      gate_pre = gate_pre + self.haw_gate_noise * noise
+    gate = jax.nn.relu(jnp.tanh(gate_pre))
+    next_state = gate * candidate + (1.0 - gate) * state
+
+    # Forward: Heaviside(gate). Backward: straight-through identity gradient.
+    gate_f32 = gate.astype(f32)
+    hard_gate = sg(jnp.ceil(gate_f32)) + gate_f32 - sg(gate_f32)
+    post_logit = self.sub(
+        'post_gate_logit', nn.Linear, self.num_events, **self.kw)(next_state)
+    return nn.cast(next_state), post_logit, hard_gate
 
   def _hawkes_embed(self, lam):
     """h_t = MLP_omega(lambda(t)). Input [B, K], output [B, haw_embed]."""
@@ -234,9 +264,10 @@ class HawkesRSSM(nj.Module):
       return carry, entries, feat
 
   def _observe(self, carry, tokens, action, reset, training):
-    deter, stoch, haw_state, haw_prev, action = nn.mask(
+    deter, stoch, haw_state, haw_prev, prev_obs, post_state, action = nn.mask(
         (carry['deter'], carry['stoch'], carry['haw_state'],
-         carry['haw_prev'], action), ~reset)
+         carry['haw_prev'], carry['haw_prev_obs'], carry['haw_post_state'],
+         action), ~reset)
     action = nn.DictConcat(self.act_space, 1)(action)
     action = nn.mask(action, ~reset)
 
@@ -257,25 +288,27 @@ class HawkesRSSM(nj.Module):
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
     # --- Posterior event distribution p_t (becomes haw_prev for next step) ---
-    # eps_t: prediction-surprise signal. We compare the prior over the
-    # discrete stoch latent (predicted from deter alone) against the
-    # posterior (which saw the new observation). High KL = the observation
-    # carried information the dynamics could not predict — i.e. an event.
-    prior_logit = sg(self._prior(deter))
-    eps = self._dist(logit).kl(self._dist(prior_logit))[..., None].astype(nn.COMPUTE_DTYPE)  # [B, 1]
-    post_logit = self._event_post(deter, tokens_flat, action, eps)
+    # Here tokens_flat is enc(o_{t+1}) and prev_obs is enc(o_t). Episode
+    # starts have no preceding transition and therefore use eps_t = 0.
+    eps = nn.mask(tokens_flat - prev_obs, ~reset)
+    post_input = self._event_post(deter, tokens_flat, action, eps)
+    post_state, post_logit, post_gate = self._gatel0rd_post(
+        post_input, post_state, training)
     post_probs = jax.nn.softmax(post_logit, axis=-1)
     haw_prev_next = post_probs
 
     carry = dict(
         deter=deter, stoch=stoch,
-        haw_state=haw_state, haw_prev=haw_prev_next)
+        haw_state=haw_state, haw_prev=haw_prev_next,
+        haw_prev_obs=tokens_flat, haw_post_state=post_state)
     feat = dict(
         deter=deter, stoch=stoch, logit=logit,
-        haw_lam=lam, haw_logit=post_logit, haw_embed=h_haw)
+        haw_lam=lam, haw_logit=post_logit, haw_embed=h_haw,
+        haw_gate=post_gate)
     entry = dict(
         deter=deter, stoch=stoch,
-        haw_state=haw_state, haw_prev=haw_prev_next)
+        haw_state=haw_state, haw_prev=haw_prev_next,
+        haw_prev_obs=tokens_flat, haw_post_state=post_state)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
 
@@ -301,10 +334,16 @@ class HawkesRSSM(nj.Module):
 
       carry = nn.cast(dict(
           deter=deter, stoch=stoch,
-          haw_state=haw_state, haw_prev=pri_probs))
+          haw_state=haw_state, haw_prev=pri_probs,
+          haw_prev_obs=carry['haw_prev_obs'],
+          haw_post_state=carry['haw_post_state']))
       feat = nn.cast(dict(
           deter=deter, stoch=stoch, logit=logit,
-          haw_lam=lam, haw_logit=pri_logit, haw_embed=h_haw))
+          haw_lam=lam, haw_logit=pri_logit, haw_embed=h_haw,
+          # Imagination uses the causal event prior, not the posterior
+          # GateL0RD path. Keep a zero placeholder so observed and imagined
+          # feature pytrees remain compatible when Agent.loss concatenates.
+          haw_gate=jnp.zeros_like(pri_probs)))
       return carry, (feat, action)
     else:
       unroll = length if self.unroll else 1
@@ -378,6 +417,11 @@ class HawkesRSSM(nj.Module):
     ent = -(post_p * post_lp).sum(-1)
     losses['haw_ent'] = jnp.maximum(0.0, self.haw_ent_target - ent)
 
+    # THICK GateL0RD L0 loss. Keep [B, T] for Agent.loss and apply its
+    # configured scale exactly once in the common loss aggregation.
+    post_gate = feat['haw_gate']                              # [B, T, K]
+    losses['haw_sparse'] = post_gate.mean(-1)                # [B, T]
+
     # Optional L_sup: cross-entropy against privileged labels
     if self.haw_use_supervision and extras and 'event_label' in extras:
       labels = extras['event_label']                         # [B, T] int
@@ -392,6 +436,9 @@ class HawkesRSSM(nj.Module):
     metrics['haw_lam_mean'] = lam.mean()
     metrics['haw_lam_max'] = lam.max()
     metrics['haw_post_ent'] = ent.mean()
+    metrics['haw_gate_activity'] = post_gate.mean()
+    metrics['haw_gate_open_frac'] = (
+        post_gate.sum(-1) > 0).mean().astype(f32)
     metrics['haw_alpha_abs_mean'] = jnp.abs(alpha).mean()
     metrics['haw_beta_mean'] = beta.mean()
     metrics['haw_inhibition_frac'] = (alpha < 0).mean().astype(f32)
