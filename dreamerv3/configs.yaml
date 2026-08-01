@@ -286,7 +286,7 @@ maniskill_rgb:
   env:
     maniskill:
       use_seed: true
-      num_envs: 189
+      num_envs: 128
       obs_mode: rgb
       sim_backend: gpu
       image_size: 128
@@ -344,6 +344,7 @@ mshab:
       max_episode_steps: 100        # matches mshab/configs/sac_pick.yml training horizon
       eval_max_episode_steps: 200   # matches mshab/configs/sac_pick.yml eval horizon
       frame_stack: 1                # no MSHab FrameStack; RSSM provides temporal context
+      num_envs: 189
   replay:
     size: 700000
 
