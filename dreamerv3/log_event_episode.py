@@ -62,22 +62,34 @@ def _softplus(x):
   return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
 
 
+def _host(value):
+  """Device -> host. jax_transfer_guard is 'disallow', which blocks implicit
+  transfers such as np.asarray on a device array; device_get is explicit and
+  stays allowed."""
+  try:
+    import jax
+    return np.asarray(jax.device_get(value))
+  except ImportError:
+    return np.asarray(value)
+
+
 def _fetch_hawkes_params(agent):
   """Pull scalar (b, alpha, beta) from agent.params. Mirrors _haw_params."""
   try:
     params = agent.params
-  except Exception:
-    return None
 
-  def find(name):
-    for k, v in params.items():
-      if k.endswith(name):
-        return float(np.asarray(v).reshape(()))
-    return None
+    def find(name):
+      for k, v in params.items():
+        if k.endswith(name):
+          return float(_host(v).reshape(()))
+      return None
 
-  base = find('haw_base')
-  alpha_raw = find('haw_alpha_raw')
-  beta_raw = find('haw_beta_raw')
+    base = find('haw_base')
+    alpha_raw = find('haw_alpha_raw')
+    beta_raw = find('haw_beta_raw')
+  except Exception as exc:
+    print(f'[event-episode] Hawkes params unavailable: {exc!r}')
+    return None
   if base is None or alpha_raw is None or beta_raw is None:
     return None
   return base, float(_softplus(alpha_raw)), float(_softplus(beta_raw))

@@ -266,7 +266,7 @@ maniskill_rgb:
     train_ratio: 64.0   # lower than state: CNN encoder adds cost per update
     steps: 2e6
     log_every: 1500
-    save_every: 50000
+    save_every: -1        # no checkpointing
     report_every: 7200
   batch_size: 32        # smaller: [16, 64, 64, 64, 9] RGB tensors are large
   batch_length: 64
@@ -304,7 +304,7 @@ maniskill_state:
     train_ratio: 512.0   # higher than rgb: no CNN encoder cost
     steps: 2e6
     log_every: 1500
-    save_every: 50000
+    save_every: -1        # no checkpointing
     report_every: 7200
   batch_size: 16
   batch_length: 64
@@ -337,6 +337,7 @@ mshab:
     eval_envs: 63
     eval_eps: 1
     eval_reconfiguration_frequency: 0   # matches SAC eval: fixed scene set, no reconfigure per reset
+    save_every: -1        # no checkpointing
     report_every: 72000
   env:
     maniskill:

@@ -356,7 +356,9 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
         eval_payload.update(build_event_episode_payload(
             agent, captured, max_depth=max_depth))
       except Exception as exc:
-        print(f'[event-episode] eval logging failed: {exc}')
+        import traceback
+        print(f'[event-episode] eval logging failed: {exc!r}')
+        traceback.print_exc()
     _wandb_log_direct(eval_payload, step)
 
     if do_video:
@@ -466,7 +468,10 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       logger.add({'timer': elements.timer.stats()['summary']})
       logger.write()
 
-  cp.save()
+  # save_every < 0 disables checkpointing entirely. There is no periodic
+  # save in this loop; this is the only cp.save() call.
+  if args.save_every >= 0:
+    cp.save()
 
   if eval_env is not None:
     eval_env.close()
