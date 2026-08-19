@@ -150,7 +150,7 @@ class Agent(embodied.jax.Agent):
     # and the train assertion `data.keys() == self.spaces.keys()` rejects
     # any extra fields. eval-mode outs are consumed locally and discarded.
     if self.hawkes and mode == 'eval':
-      for key in ('haw_prob', 'haw_event', 'haw_prior_prob', 'haw_lam'):
+      for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
         out[key] = feat[key]
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:

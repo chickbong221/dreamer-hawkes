@@ -313,12 +313,8 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
 
         if event_data is not None and eval_episode_idx == 0 and \
            'haw_prob' in outs:
-          for key in ('haw_prob', 'haw_event', 'haw_prior_prob',
-                      'haw_lam'):
+          for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
             event_data[key].append(float(_to_numpy(outs[key])[0]))
-          event_data['reward'].append(float(obs['reward'][0]))
-          if 'action' in acts:
-            event_data['action'].append(_to_numpy(acts['action'])[0].copy())
           for key in ('depth_head', 'depth_hand'):
             if key in obs:
               event_data[key].append(obs[key][0].copy())
