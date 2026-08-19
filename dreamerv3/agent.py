@@ -86,9 +86,13 @@ class Agent(embodied.jax.Agent):
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
 
+    self.hawkes = config.dyn.typ == 'hawkes'
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
+    if not self.hawkes:
+      scales = {k: v for k, v in scales.items() if not k.startswith('haw')}
+      scales.pop('event_rate', None)
     self.scales = scales
 
   @property
@@ -126,8 +130,11 @@ class Agent(embodied.jax.Agent):
     kw = dict(training=False, single=True)
     reset = obs['is_first']
     enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
+    dynkw = dict(kw)
+    if self.hawkes:
+      dynkw['sample_event'] = (mode != 'eval')
     dyn_carry, dyn_entry, feat = self.dyn.observe(
-        dyn_carry, tokens, prevact, reset, **kw)
+        dyn_carry, tokens, prevact, reset, **dynkw)
     dec_entry = {}
     if dec_carry:
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
@@ -142,10 +149,9 @@ class Agent(embodied.jax.Agent):
     # because the train-mode driver feeds `outs` into the replay buffer,
     # and the train assertion `data.keys() == self.spaces.keys()` rejects
     # any extra fields. eval-mode outs are consumed locally and discarded.
-    if self.config.dyn.typ == 'hawkes' and mode == 'eval':
-      out['haw_logit'] = feat['haw_logit']
-      out['haw_lam'] = feat['haw_lam']
-      out['haw_gate'] = feat['haw_gate']
+    if self.hawkes and mode == 'eval':
+      for key in ('haw_prob', 'haw_event', 'haw_prior_prob', 'haw_lam'):
+        out[key] = feat[key]
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
       out.update(elements.tree.flatdict(dict(
@@ -182,34 +188,19 @@ class Agent(embodied.jax.Agent):
     enc_carry, enc_entries, tokens = self.enc(
         enc_carry, obs, reset, training)
 
-    # dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
-    #     dyn_carry, tokens, prevact, reset, training)
-
-    # Build kwargs for the dynamics loss. Only the Hawkes dynamics consumes
-    # privileged event labels; the stock RSSM path is left exactly as upstream.
-    loss_kwargs = {}
-    if self.config.dyn.typ == 'hawkes':
-      extras = {}
-      if 'log/success_once' in obs and 'log/fail_once' in obs:
-        succ = obs['log/success_once'].astype('int32')
-        fail = obs['log/fail_once'].astype('int32')
-        # 0 = idle, 1 = success, 2 = fail
-        extras['event_label'] = succ + 2 * (fail * (1 - succ))
-      loss_kwargs['extras'] = extras
-
     dyn_carry, dyn_entries, los, repfeat, mets = self.dyn.loss(
-      dyn_carry, tokens, prevact, reset, training=training, **loss_kwargs)
+        dyn_carry, tokens, prevact, reset, training=training)
 
     losses.update(los)
     metrics.update(mets)
     dec_carry, dec_entries, recons = self.dec(
         dec_carry, repfeat, reset, training)
-    inp = sg(self.feat2tensor(repfeat), skip=self.config.reward_grad)
+    inp = sg(self._headfeat(repfeat), skip=self.config.reward_grad)
     losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
     con = f32(~obs['is_terminal'])
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
-    losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
+    losses['con'] = self.con(self._headfeat(repfeat), 2).loss(con)
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
@@ -242,8 +233,8 @@ class Agent(embodied.jax.Agent):
     inp = self.feat2tensor(imgfeat)
     los, imgloss_out, mets = imag_loss(
         imgact,
-        self.rew(inp, 2).pred(),
-        self.con(inp, 2).prob(1),
+        self._headmix(self.rew, imgfeat, lambda o: o.pred()),
+        self._headmix(self.con, imgfeat, lambda o: o.prob(1)),
         self.pol(inp, 2),
         self.val(inp, 2),
         self.slowval(inp, 2),
@@ -283,6 +274,31 @@ class Agent(embodied.jax.Agent):
     entries = (enc_entries, dyn_entries, dec_entries)
     outs = {'tokens': tokens, 'repfeat': repfeat, 'losses': losses}
     return loss, (carry, entries, outs, metrics)
+
+  def _headfeat(self, feat):
+    """Base feature, plus the binary event for the reward/cont heads."""
+    x = self.feat2tensor(feat)
+    if not self.hawkes:
+      return x
+    return jnp.concatenate(
+        [x, nn.cast(feat['haw_head_event'])[..., None]], -1)
+
+  def _headmix(self, head, feat, readout):
+    """E_y[readout(head)] over the binary event.
+
+    Evaluates the head only at y in {0, 1}, so it never leaves the support it
+    was trained on. Exact for observed steps (weight is already 0 or 1) and
+    the exact expectation for imagined steps (weight is p_haw), without the
+    return noise of a hard sample.
+    """
+    if not self.hawkes:
+      return readout(head(self.feat2tensor(feat), 2))
+    base = self.feat2tensor(feat)
+    w = f32(feat['haw_head_event'])
+    ones = jnp.ones((*w.shape, 1), base.dtype)
+    out0 = f32(readout(head(jnp.concatenate([base, 0 * ones], -1), 2)))
+    out1 = f32(readout(head(jnp.concatenate([base, ones], -1), 2)))
+    return (1 - w) * out0 + w * out1
 
   def report(self, carry, data):
     if not self.config.report:

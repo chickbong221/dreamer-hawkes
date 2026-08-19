@@ -1,80 +1,45 @@
-"""
-Evaluation event-episode visualizer.
+"""Evaluation event-episode visualizer for the binary-event Hawkes RSSM.
 
 Builds W&B panels from the first episode of evaluation environment index 0.
 The evaluation loop supplies already-collected Hawkes features and observation
 frames, so this module never creates an environment or runs an extra rollout.
 
-Outputs to wandb (all under `event/`):
-  event/post_probs        — [K, T] heatmap of softmax posterior per step
-  event/lambda            — [K, T] heatmap of Hawkes intensities per step
-  event/gate_activity     — [K, T] heatmap of GateL0RD update activity
-  event/argmax_trace      — [1, T] colored strip, color = argmax category id
-  event/argmax_per_step   — line plot of argmax category id over time
-  event/reward_trace      — line plot of reward over time
-  event/episode_video     — [T, H, 2W, 3] depth_head | depth_hand video,
-                            with a colored top border keyed to argmax category
-  event/phases            — wandb.Table: phase index, category, start, end,
-                            length, mean probability, head/hand thumbnails
-  event/alpha             — [K, K] heatmap of learned alpha (signed, diverging)
-  event/beta              — [K, K] heatmap of learned beta (positive)
-  event/mu                — [K] bar chart of learned mu
+Outputs (all under `event/`):
+  post_prob        pi_t over time
+  prior_prob       p_haw_t over time
+  spike_trace      hard events as a binary strip
+  lambda           scalar intensity over time
+  post_prior_gap   |pi_t - p_haw_t| over time
+  reward_trace     reward over time
+  expected_rate    mean pi_t
+  hard_rate        mean hard event
+  rate_error       hard_rate - expected_rate
+  expected_count   sum pi_t
+  hard_count       number of spikes
+  events           one table row per spike
+  episode_video    depth_head | depth_hand, red border on spike frames
+  base/alpha/beta  learned scalar Hawkes parameters
 """
-
-import io
 
 import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Colormap helpers
+# Colormap and image helpers
 # ---------------------------------------------------------------------------
 
 def _viridis(values):
-  """Apply a viridis-like colormap. Input [..] float in [0,1], output [..,3] u8.
-
-  Falls back to a hand-rolled approximation if matplotlib is unavailable.
-  """
+  """Apply a viridis-like colormap. Input [..] float in [0,1] -> [..,3] u8."""
   values = np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
   try:
     import matplotlib.cm as cm
     rgba = cm.viridis(values)
     return (rgba[..., :3] * 255).astype(np.uint8)
   except Exception:
-    # Crude hand-rolled gradient: dark blue → green → yellow.
     r = np.clip(2 * values - 0.5, 0, 1)
     g = np.clip(2 * values * (1 - values) * 4, 0, 1)
     b = np.clip(1 - 1.5 * values, 0, 1)
-    out = np.stack([r, g, b], axis=-1)
-    return (out * 255).astype(np.uint8)
-
-
-def _diverging(values):
-  """Diverging colormap for signed values, centered at 0. Output [..,3] u8."""
-  values = np.asarray(values, dtype=np.float32)
-  scale = max(float(np.abs(values).max()), 1e-6)
-  values = np.clip(values / scale, -1.0, 1.0)
-  try:
-    import matplotlib.cm as cm
-    rgba = cm.coolwarm((values + 1.0) * 0.5)
-    return (rgba[..., :3] * 255).astype(np.uint8)
-  except Exception:
-    pos = np.clip(values, 0, 1)
-    neg = np.clip(-values, 0, 1)
-    out = np.stack([pos + (1 - pos - neg), 1 - pos - neg, neg + (1 - pos - neg)],
-                   axis=-1)
-    return (out * 255).clip(0, 255).astype(np.uint8)
-
-
-def _category_palette(K):
-  """Return [K, 3] uint8 RGB palette via the tab20 colormap."""
-  try:
-    import matplotlib.cm as cm
-    rgba = cm.tab20(np.arange(K) / max(K - 1, 1))
-    return (rgba[..., :3] * 255).astype(np.uint8)
-  except Exception:
-    rng = np.random.RandomState(0)
-    return (rng.rand(K, 3) * 255).astype(np.uint8)
+    return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
 
 def _upscale(image, target_h, target_w):
@@ -82,27 +47,8 @@ def _upscale(image, target_h, target_w):
   h, w = image.shape[:2]
   rh = max(target_h // max(h, 1), 1)
   rw = max(target_w // max(w, 1), 1)
-  out = np.repeat(np.repeat(image, rh, axis=0), rw, axis=1)
-  return out
+  return np.repeat(np.repeat(image, rh, axis=0), rw, axis=1)
 
-
-# ---------------------------------------------------------------------------
-# Phase detection
-# ---------------------------------------------------------------------------
-
-def _detect_phases(argmax):
-  """Return list of (cat, start, end_exclusive) for contiguous argmax runs."""
-  argmax = np.asarray(argmax)
-  if len(argmax) == 0:
-    return []
-  boundaries = np.where(np.diff(argmax, prepend=argmax[0] - 1) != 0)[0]
-  ends = np.append(boundaries[1:], len(argmax))
-  return [(int(argmax[s]), int(s), int(e)) for s, e in zip(boundaries, ends)]
-
-
-# ---------------------------------------------------------------------------
-# Depth → RGB
-# ---------------------------------------------------------------------------
 
 def _depth_to_rgb(depth_u16, max_depth):
   """Convert depth uint16 mm [H, W, 1] to RGB uint8 [H, W, 3]."""
@@ -112,43 +58,29 @@ def _depth_to_rgb(depth_u16, max_depth):
   return np.stack([gray, gray, gray], axis=-1)
 
 
-# ---------------------------------------------------------------------------
-# Hawkes static param fetch
-# ---------------------------------------------------------------------------
+def _softplus(x):
+  return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
+
 
 def _fetch_hawkes_params(agent):
-  """Pull mu, alpha, beta from agent.params using softplus on raw scalars.
-
-  Matches the math in hawkes_rssm.py:_hawkes_params. Returns numpy arrays.
-  Returns (None, None, None) if the params are not present (e.g. dyn.typ != hawkes).
-  """
+  """Pull scalar (b, alpha, beta) from agent.params. Mirrors _haw_params."""
   try:
     params = agent.params
   except Exception:
-    return None, None, None
-
-  def _find(name):
-    for k, v in params.items():
-      if k.endswith(name):
-        return np.asarray(v)
     return None
 
-  mu_raw = _find('haw_mu_raw')
-  alpha = _find('haw_alpha')
-  beta_raw = _find('haw_beta_raw')
-  if mu_raw is None or alpha is None or beta_raw is None:
-    return None, None, None
+  def find(name):
+    for k, v in params.items():
+      if k.endswith(name):
+        return float(np.asarray(v).reshape(()))
+    return None
 
-  cfg = agent.config.dyn.hawkes
-  init_mu = float(cfg.get('haw_init_mu', 0.1))
-  init_beta = float(cfg.get('haw_init_beta', 1.0))
-
-  def softplus(x):
-    return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
-
-  mu = softplus(mu_raw + init_mu)
-  beta = softplus(beta_raw + init_beta)
-  return mu, alpha, beta
+  base = find('haw_base')
+  alpha_raw = find('haw_alpha_raw')
+  beta_raw = find('haw_beta_raw')
+  if base is None or alpha_raw is None or beta_raw is None:
+    return None
+  return base, float(_softplus(alpha_raw)), float(_softplus(beta_raw))
 
 
 # ---------------------------------------------------------------------------
@@ -156,12 +88,13 @@ def _fetch_hawkes_params(agent):
 # ---------------------------------------------------------------------------
 
 def build_event_episode_payload(agent, data, max_depth=None):
-  """Build event-assignment panels from an episode captured by evalfn().
+  """Build binary-event panels from an episode captured by the eval loop.
 
   Args:
     agent: Dreamer agent with Hawkes dynamics.
     data: arrays captured from evaluation environment index 0. Required keys
-      are haw_logit, haw_lam, haw_gate, and reward. Depth frames are optional.
+      are haw_prob, haw_event, haw_prior_prob, haw_lam and reward. Action and
+      depth frames are optional.
     max_depth: depth maximum in millimeters for uint16 visualization.
 
   Returns:
@@ -181,130 +114,109 @@ def build_event_episode_payload(agent, data, max_depth=None):
     print('[event-episode] no active wandb run — skipping.')
     return {}
 
-  if 'haw_logit' not in data or len(data['haw_logit']) == 0:
+  if 'haw_prob' not in data or len(data['haw_prob']) == 0:
     print('[event-episode] No Hawkes features captured — skipping.')
     return {}
 
   data = {key: np.asarray(value) for key, value in data.items()}
   max_depth = float(max_depth or 20000.0)
 
-  haw_logit = data['haw_logit']                       # [T, K]
-  haw_lam = data['haw_lam']                           # [T, K]
-  haw_gate = data['haw_gate']                         # [T, K]
-  post_probs = _softmax(haw_logit, axis=-1)           # [T, K]
-  argmax = post_probs.argmax(-1)                      # [T]
-  T, K = post_probs.shape
-  reward = data['reward'][:T]                         # align: last step may be terminal
+  prob = np.asarray(data['haw_prob'], np.float32).reshape(-1)
+  T = len(prob)
+  event = np.asarray(data['haw_event'], np.float32).reshape(-1)[:T]
+  prior = np.asarray(data['haw_prior_prob'], np.float32).reshape(-1)[:T]
+  lam = np.asarray(data['haw_lam'], np.float32).reshape(-1)[:T]
+  reward = np.asarray(data['reward'], np.float32).reshape(-1)[:T]
+  gap = np.abs(prob - prior)
+  spikes = np.nonzero(event > 0.5)[0]
 
-  # ---- Heatmaps (K rows × T cols, displayed as wandb images) ----------------
   payload = {}
 
-  # post_probs heatmap: shape [K, T], normalized per-cell to [0, 1].
-  pp_img = post_probs.T                                       # [K, T]
-  pp_rgb = _viridis(pp_img)                                   # [K, T, 3]
-  pp_rgb = _upscale(pp_rgb, target_h=K * 16, target_w=T * 6)
-  payload['event/post_probs'] = wandb.Image(
-      pp_rgb, caption=f'posterior P(e_t=k) — rows=K(0..{K-1}), cols=t(0..{T-1})')
+  # ---- Per-step traces ------------------------------------------------------
+  trace = wandb.Table(
+      data=[[t, float(prob[t]), float(prior[t]), float(lam[t]),
+             float(event[t]), float(gap[t]), float(reward[t])]
+            for t in range(T)],
+      columns=['t', 'post_prob', 'prior_prob', 'lambda', 'hard_event',
+               'post_prior_gap', 'reward'])
+  for key, col, title in (
+      ('post_prob', 'post_prob', 'Posterior event probability pi_t'),
+      ('prior_prob', 'prior_prob', 'Causal Hawkes probability p_haw_t'),
+      ('lambda', 'lambda', 'Hawkes intensity lambda_t'),
+      ('post_prior_gap', 'post_prior_gap', '|pi_t - p_haw_t|'),
+      ('reward_trace', 'reward', 'Reward per timestep')):
+    payload[f'event/{key}'] = wandb.plot.line(trace, 't', col, title=title)
 
-  # lambda heatmap: normalize per-row (per category) so categories with
-  # different scales are comparable.
-  lam_norm = haw_lam / np.maximum(haw_lam.max(0, keepdims=True), 1e-6)
-  lam_rgb = _viridis(lam_norm.T)
-  lam_rgb = _upscale(lam_rgb, target_h=K * 16, target_w=T * 6)
-  payload['event/lambda'] = wandb.Image(
-      lam_rgb, caption='Hawkes intensity λ_k(t), normalized per row')
+  # ---- Spike strip: white where an event fired ------------------------------
+  strip = _upscale((event > 0.5).astype(np.float32)[None, :], 24, T * 6)
+  payload['event/spike_trace'] = wandb.Image(
+      _viridis(strip), caption=f'hard events ({len(spikes)} of {T} steps)')
 
-  gate_rgb = _viridis(haw_gate.T)
-  gate_rgb = _upscale(gate_rgb, target_h=K * 16, target_w=T * 6)
-  payload['event/gate_activity'] = wandb.Image(
-      gate_rgb, caption='GateL0RD hard update gates — rows=K, cols=t')
+  # ---- Scalar summaries -----------------------------------------------------
+  hard_rate = float(event.mean()) if T else 0.0
+  expected_rate = float(prob.mean()) if T else 0.0
+  payload['event/expected_rate'] = expected_rate
+  payload['event/hard_rate'] = hard_rate
+  payload['event/rate_error'] = hard_rate - expected_rate
+  payload['event/expected_count'] = float(prob.sum())
+  payload['event/hard_count'] = int(len(spikes))
+  payload['event/post_prior_gap_mean'] = float(gap.mean()) if T else 0.0
 
-  # argmax strip: colored band, one column per timestep, color = category.
-  palette = _category_palette(K)
-  strip = palette[argmax]                                     # [T, 3]
-  strip = strip[None, :, :]                                   # [1, T, 3]
-  strip = _upscale(strip, target_h=24, target_w=T * 6)
-  payload['event/argmax_trace'] = wandb.Image(
-      strip, caption='argmax category per timestep (color = category id)')
-
-  # argmax / reward line plots
-  table_trace = wandb.Table(
-      data=[[t, int(argmax[t]), float(reward[t])] for t in range(T)],
-      columns=['t', 'argmax_category', 'reward'])
-  payload['event/argmax_per_step'] = wandb.plot.line(
-      table_trace, 't', 'argmax_category',
-      title='Argmax event category per timestep')
-  payload['event/reward_trace'] = wandb.plot.line(
-      table_trace, 't', 'reward', title='Reward per timestep')
-
-  # ---- Per-phase table ------------------------------------------------------
-  phases = _detect_phases(argmax)
+  # ---- One table row per spike ---------------------------------------------
   has_head = 'depth_head' in data
   has_hand = 'depth_hand' in data
-  cols = ['phase', 'category', 'start', 'end', 'length', 'mean_prob']
+  has_act = 'action' in data
+  cols = ['t', 'post_prob', 'prior_prob', 'lambda', 'reward']
+  if has_act:
+    cols.append('action')
   if has_head:
-    cols.append('head_repr')
+    cols.append('head')
   if has_hand:
-    cols.append('hand_repr')
+    cols.append('hand')
   rows = []
-  for idx, (cat, s, e) in enumerate(phases):
-    mid = (s + e) // 2
-    mid = min(mid, T - 1)
-    mean_p = float(post_probs[s:e, cat].mean())
-    row = [idx, int(cat), int(s), int(e), int(e - s), round(mean_p, 4)]
+  for t in spikes:
+    t = int(t)
+    row = [t, round(float(prob[t]), 4), round(float(prior[t]), 4),
+           round(float(lam[t]), 4), round(float(reward[t]), 4)]
+    if has_act:
+      row.append(np.array2string(
+          np.asarray(data['action'][t]).reshape(-1), precision=3))
     if has_head:
-      head_rgb = _depth_to_rgb(data['depth_head'][mid], max_depth)
-      row.append(wandb.Image(head_rgb, caption=f'phase {idx} cat {cat} t={mid}'))
+      row.append(wandb.Image(
+          _depth_to_rgb(data['depth_head'][t], max_depth),
+          caption=f'spike t={t}'))
     if has_hand:
-      hand_rgb = _depth_to_rgb(data['depth_hand'][mid], max_depth)
-      row.append(wandb.Image(hand_rgb, caption=f'phase {idx} cat {cat} t={mid}'))
+      row.append(wandb.Image(
+          _depth_to_rgb(data['depth_hand'][t], max_depth),
+          caption=f'spike t={t}'))
     rows.append(row)
-  payload['event/phases'] = wandb.Table(data=rows, columns=cols)
+  payload['event/events'] = wandb.Table(data=rows, columns=cols)
 
-  # ---- Episode video with phase-coloured border -----------------------------
+  # ---- Episode video, red border on spike frames ----------------------------
   if has_head:
-    head = data['depth_head'][:T]
-    hand = data['depth_hand'][:T] if has_hand else None
-    head_rgb = np.stack([_depth_to_rgb(f, max_depth) for f in head], 0)  # [T,H,W,3]
-    if hand is not None:
-      hand_rgb = np.stack([_depth_to_rgb(f, max_depth) for f in hand], 0)
-      frames = np.concatenate([head_rgb, hand_rgb], axis=2)              # [T,H,2W,3]
+    head = np.stack(
+        [_depth_to_rgb(f, max_depth) for f in data['depth_head'][:T]], 0)
+    if has_hand:
+      hand = np.stack(
+          [_depth_to_rgb(f, max_depth) for f in data['depth_hand'][:T]], 0)
+      frames = np.concatenate([head, hand], axis=2)
     else:
-      frames = head_rgb
-    # Stamp a 6-px top border in the argmax category's colour.
-    border_h = 6
+      frames = head
+    pad = 6
     frames = np.concatenate(
-        [np.zeros((T, border_h, frames.shape[2], 3), np.uint8), frames], axis=1)
-    for t in range(T):
-      frames[t, :border_h] = palette[argmax[t]]
-    # wandb.Video expects [T, C, H, W]
+        [np.zeros((T, pad, frames.shape[2], 3), np.uint8), frames], axis=1)
+    frames[event > 0.5, :pad] = np.array([255, 0, 0], np.uint8)
     payload['event/episode_video'] = wandb.Video(
         frames.transpose(0, 3, 1, 2), fps=10, format='mp4',
-        caption='depth_head | depth_hand; top border = argmax category')
+        caption='depth_head | depth_hand; red top border = event')
 
-  # ---- Static Hawkes parameters --------------------------------------------
-  mu, alpha, beta = _fetch_hawkes_params(agent)
-  if alpha is not None:
-    payload['event/alpha'] = wandb.Image(
-        _upscale(_diverging(alpha), K * 24, K * 24),
-        caption='alpha[k,j] — excitation from j to k (red=excite, blue=inhibit)')
-  if beta is not None:
-    bmax = float(beta.max())
-    beta_norm = beta / max(bmax, 1e-6)
-    payload['event/beta'] = wandb.Image(
-        _upscale(_viridis(beta_norm), K * 24, K * 24),
-        caption=f'beta[k,j] — decay (max={bmax:.3f})')
-  if mu is not None:
-    mu_table = wandb.Table(
-        data=[[k, float(mu[k])] for k in range(K)],
-        columns=['k', 'mu'])
-    payload['event/mu'] = wandb.plot.bar(
-        mu_table, 'k', 'mu', title='mu_k — baseline intensity per category')
+  # ---- Learned scalar Hawkes parameters ------------------------------------
+  params = _fetch_hawkes_params(agent)
+  if params is not None:
+    base, alpha, beta = params
+    payload['event/base'] = base
+    payload['event/alpha'] = alpha
+    payload['event/beta'] = beta
+    payload['event/base_prob'] = float(-np.expm1(-_softplus(base)))
 
   return payload
-
-
-def _softmax(x, axis=-1):
-  x = x - x.max(axis=axis, keepdims=True)
-  ex = np.exp(x)
-  return ex / np.maximum(ex.sum(axis=axis, keepdims=True), 1e-8)

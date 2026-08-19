@@ -312,9 +312,10 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
             list(outs.keys()), list(acts.keys()))
 
         if event_data is not None and eval_episode_idx == 0 and \
-           'haw_logit' in outs:
-          for key in ('haw_logit', 'haw_lam', 'haw_gate'):
-            event_data[key].append(_to_numpy(outs[key])[0].copy())
+           'haw_prob' in outs:
+          for key in ('haw_prob', 'haw_event', 'haw_prior_prob',
+                      'haw_lam'):
+            event_data[key].append(float(_to_numpy(outs[key])[0]))
           event_data['reward'].append(float(obs['reward'][0]))
           if 'action' in acts:
             event_data['action'].append(_to_numpy(acts['action'])[0].copy())

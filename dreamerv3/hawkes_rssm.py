@@ -1,34 +1,21 @@
+"""Binary-event Hawkes RSSM for DreamerV3. Selected via `--dyn.typ hawkes`.
+
+Observed causal chain (x_t never reaches h_t, only h_{t+1}):
+
+  M_t = exp(-beta) M_{t-1} + alpha y_{t-1}
+  lam_t = softplus(b + M_t + g_eta(h_{t-1}, a_{t-1}))
+  h_t = core(h_{t-1}, z_{t-1}, a_{t-1}, omega([M_t, log1p(lam_t)]))
+  z_t = RSSM posterior
+  pi_t = sigmoid(D_psi(a_{t-1}, sg(u_t - u_{t-1})))
+  y_t = straight-through Bernoulli(pi_t) -> reward, cont, Hawkes at t+1
+
+Losses: Dreamer picks where events fire; `event_rate` is a two-sided KL
+budget on mean(pi); `haw` fits b/alpha/beta/eta to detached detector
+statistics and has zero gradient into the detector or the world model.
+
+Hawkes scalars are float32 (the recurrence accumulates); activations stay in
+COMPUTE_DTYPE. The carry is mixed precision -- never blanket-cast it.
 """
-Hawkes-Aware RSSM dynamics for DreamerV3 + ManiSkill.
-
-Drop-in replacement for `dreamerv3.rssm.RSSM` selected via `--dyn.typ hawkes`.
-Implements the revised HTWM algorithm:
-
-  1. Two-encoder events: causal prior q_psi^pri(z_t, a_t) used at imagination
-     time; posterior q_psi^pos(z_t, z_{t+1}, a_t, eps_t) used during training.
-  2. Multivariate Hawkes intensity with O(1) recursive update on the
-     exponential kernel (per-pair state S_{k,j}).
-  3. Closed-form compensator integral for the Hawkes NLL.
-  4. Signed alpha + softplus(lambda) so the process can express inhibition
-     as well as excitation (nonlinear Hawkes, Bremaud & Massoulie 1996).
-  5. Hawkes context fused into the deterministic state via h_t = MLP(lambda_t).
-  6. Per-trajectory state is carried in the dynamics carry dict alongside
-     the standard deter/stoch, so observe/imagine/scan work unchanged.
-
-Notes specific to this repo:
-  - The full Hawkes-aware Transformer attention + KV cache (Eqs. 4-5 in the
-    paper) is a separate component intended to replace the GRU-style `_core`
-    in a future iteration. This file keeps the GRU core and injects Hawkes
-    structure via (a) the event-conditioned context vector h_t and (b) an
-    additional loss term L_haw + L_kl + L_ent + (optional) L_sup. Cache-based
-    attention requires a Transformer backbone and a different unroll pattern
-    in `embodied.run.train`; we leave that as the obvious next step.
-  - Privileged event labels (`log/success_once`, `log/fail_once`) are
-    consumed via the `extras` dict passed into `loss()`. When absent, the
-    supervision loss is zero and the model trains in fully unsupervised mode.
-"""
-
-import math
 
 import einops
 import elements
@@ -43,10 +30,29 @@ f32 = jnp.float32
 sg = jax.lax.stop_gradient
 
 
-class HawkesRSSM(nj.Module):
-  """Hawkes-aware RSSM. Selected via `--dyn.typ hawkes`."""
+def _inv_softplus(y):
+  y = float(y)
+  assert y > 0.0, y
+  return float(y + np.log(-np.expm1(-y)))
 
-  # --- Inherited RSSM hyperparameters (same defaults as rssm.RSSM) ----------
+
+def _logit_of(p):
+  p = float(p)
+  assert 0.0 < p < 1.0, p
+  return float(np.log(p) - np.log1p(-p))
+
+
+def _const_init(value):
+  """Constant initializer matching the nn.Linear winit/binit protocol."""
+  def init(shape, dtype=f32, fshape=None):
+    shape = (shape,) if isinstance(shape, int) else tuple(shape)
+    return jnp.full(shape, value, dtype)
+  return init
+
+
+class HawkesRSSM(nj.Module):
+
+  # Inherited RSSM hyperparameters (same defaults as rssm.RSSM).
   deter: int = 4096
   hidden: int = 2048
   stoch: int = 32
@@ -63,310 +69,266 @@ class HawkesRSSM(nj.Module):
   blocks: int = 8
   free_nats: float = 1.0
 
-  # --- Hawkes-specific hyperparameters --------------------------------------
+  # Hawkes hyperparameters.
   obs_dim: int = 0                    # flattened encoder token width
-  num_events: int = 8                # K
-  haw_hidden: int = 256              # MLP_omega hidden width
-  haw_embed: int = 128               # h_t dimensionality
-  haw_kl_balance: float = 0.1        # beta_kl in KL-balancing
-  haw_ent_target: float = 0.5        # entropy floor; below this, L_ent kicks in
-  haw_init_alpha: float = 0.01       # alpha init scale (small so HTWM ~ RSSM at start)
-  haw_init_beta: float = 1.0         # beta init (decay over ~1 step)
-  haw_init_mu: float = 0.1           # mu init (baseline intensity)
-  haw_gumbel_tau: float = 1.0        # Gumbel-Softmax temperature
-  haw_gate_noise: float = 0.1        # GateL0RD Gaussian train-time noise
-  haw_use_supervision: bool = False  # if True, expect privileged labels in extras
+  haw_hidden: int = 256
+  haw_embed: int = 32
+  haw_context_hidden: int = 64
+  haw_target_rate: float = 0.05       # rho
+  haw_rate_clip: float = 1e-3
+  haw_eval_threshold: float = 0.5
+  haw_init_alpha: float = 0.1
+  haw_init_beta: float = 1.0
+  haw_detector_outscale: float = 0.1  # keeps init pi tight around rho
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
     assert self.obs_dim > 0, self.obs_dim
+    assert 0.0 < self.haw_target_rate < 1.0, self.haw_target_rate
     self.act_space = act_space
     self.kw = kw
+    rho = float(self.haw_target_rate)
+    self._init_base = _inv_softplus(-np.log1p(-rho))  # 1-exp(-softplus(b))=rho
+    self._init_alpha_raw = _inv_softplus(self.haw_init_alpha)
+    self._init_beta_raw = _inv_softplus(self.haw_init_beta)
+    self._init_det_bias = _logit_of(rho)
 
-  # =========================================================================
-  #  embodied.jax compatibility surface — identical to rssm.RSSM
-  # =========================================================================
+  # ---------------------------------------------------------------- carry --
 
   @property
   def entry_space(self):
+    # `haw_prev_obs` is deliberately absent: obs_dim floats per stored step
+    # would add tens of GB to replay. Restored chunks mask their first
+    # transition instead.
     return dict(
         deter=elements.Space(np.float32, self.deter),
         stoch=elements.Space(np.float32, (self.stoch, self.classes)),
-        # Hawkes per-pair state S_{k,j} carried alongside the latent state.
-        # Shape [K, K]. Stored as float32 even when COMPUTE_DTYPE is bf16,
-        # because the recursion is numerically delicate.
-        haw_state=elements.Space(np.float32, (self.num_events, self.num_events)),
-        # Last event distribution p_{t-1}, used by the recursion to add
-        # alpha_{k, e_{t-1}} into S without committing to a hard sample.
-        haw_prev=elements.Space(np.float32, (self.num_events,)),
-        # Previous encoder token for eps_t = enc(o_{t+1}) - enc(o_t).
-        haw_prev_obs=elements.Space(np.float32, (self.obs_dim,)),
-        # Recurrent GateL0RD state on the posterior event path.
-        haw_post_state=elements.Space(np.float32, (self.num_events,)))
+        haw_state=elements.Space(np.float32),
+        haw_prev=elements.Space(np.float32))
 
   def initial(self, bsize):
-    return nn.cast(dict(
-        deter=jnp.zeros([bsize, self.deter], f32),
-        stoch=jnp.zeros([bsize, self.stoch, self.classes], f32),
-        haw_state=jnp.zeros([bsize, self.num_events, self.num_events], f32),
-        haw_prev=jnp.zeros([bsize, self.num_events], f32),
-        haw_prev_obs=jnp.zeros([bsize, self.obs_dim], f32),
-        haw_post_state=jnp.zeros([bsize, self.num_events], f32)))
+    # Mixed precision on purpose; do not wrap in nn.cast().
+    return dict(
+        deter=nn.cast(jnp.zeros([bsize, self.deter], f32)),
+        stoch=nn.cast(jnp.zeros([bsize, self.stoch, self.classes], f32)),
+        haw_state=jnp.zeros([bsize], f32),
+        haw_prev=jnp.zeros([bsize], f32),
+        haw_prev_obs=nn.cast(jnp.zeros([bsize, self.obs_dim], f32)),
+        haw_prev_valid=jnp.zeros([bsize], bool))
 
   def truncate(self, entries, carry=None):
     assert entries['deter'].ndim == 3, entries['deter'].shape
-    return jax.tree.map(lambda x: x[:, -1], entries)
+    assert carry is not None, 'HawkesRSSM.truncate needs the live carry'
+    out = jax.tree.map(lambda x: x[:, -1], entries)
+    out['deter'] = nn.cast(out['deter'])
+    out['stoch'] = nn.cast(out['stoch'])
+    out['haw_state'] = f32(out['haw_state'])
+    out['haw_prev'] = f32(out['haw_prev'])
+    out['haw_prev_obs'] = jnp.zeros_like(carry['haw_prev_obs'])
+    out['haw_prev_valid'] = jnp.zeros_like(carry['haw_prev_valid'])
+    return out
 
   def starts(self, entries, carry, nlast):
+    # Imagination never reads haw_prev_obs, so it is not materialized here.
     B = len(jax.tree.leaves(carry)[0])
-    return jax.tree.map(
-        lambda x: x[:, -nlast:].reshape((B * nlast, *x.shape[2:])), entries)
+    keys = ('deter', 'stoch', 'haw_state', 'haw_prev')
+    return {k: entries[k][:, -nlast:].reshape(
+        (B * nlast, *entries[k].shape[2:])) for k in keys}
 
-  # =========================================================================
-  #  Hawkes parameter modules
-  # =========================================================================
+  # --------------------------------------------------------------- Hawkes --
 
-  def _hawkes_params(self):
-    """Return (mu [K], alpha [K,K], beta [K,K]).
+  def _haw_params(self):
+    """Scalar (b, alpha, beta) in float32; alpha, beta > 0."""
+    base = self.value('haw_base', _const_init(self._init_base), ())
+    alpha_raw = self.value(
+        'haw_alpha_raw', _const_init(self._init_alpha_raw), ())
+    beta_raw = self.value(
+        'haw_beta_raw', _const_init(self._init_beta_raw), ())
+    return base, jax.nn.softplus(alpha_raw), jax.nn.softplus(beta_raw)
 
-    Parameters are stored as nj.Variable so JAX/ninjax tracks them as
-    trainable leaves. alpha is signed (nonlinear Hawkes); the intensity
-    is passed through softplus to guarantee positivity. beta and mu are
-    kept positive via softplus on a raw learnable scalar with a small
-    positive bias so initial values are sensible.
+  def _context(self, deter, action):
+    """g_eta -> scalar f32. Accepts [B, ...] or [B, T, ...]."""
+    x = jnp.concatenate([nn.cast(deter), nn.cast(action)], -1)
+    x = self.sub('ctx0', nn.Linear, self.haw_context_hidden, **self.kw)(x)
+    x = nn.act(self.act)(self.sub('ctx0norm', nn.Norm, self.norm)(x))
+    kw = dict(**self.kw, outscale=0.0)  # g_eta output starts at zero
+    x = self.sub('ctxout', nn.Linear, 1, **kw)(x)
+    return f32(x[..., 0])
+
+  def _hawkes_step(self, state, event, deter, action):
+    base, alpha, beta = self._haw_params()
+    state = jnp.exp(-beta) * state + alpha * event
+    lam = jax.nn.softplus(base + state + self._context(deter, action))
+    return state, lam, -jnp.expm1(-lam)
+
+  def _hawkes_embed(self, state, lam):
+    """omega([M_t, log1p(lam_t)]) -> [..., haw_embed] in compute dtype.
+
+    No norm on the first projection: its input is 2-D and RMS norm is scale
+    invariant, so it would divide out the intensity magnitude. Later norms
+    act on wide vectors, where the informative direction survives.
     """
-    K = self.num_events
-    mu_raw   = self.sub('haw_mu_raw',
-                        nj.Variable, jnp.zeros, (K,), f32).read()
-    alpha    = self.sub('haw_alpha',
-                        nj.Variable, jnp.zeros, (K, K), f32).read()
-    beta_raw = self.sub('haw_beta_raw',
-                        nj.Variable, jnp.zeros, (K, K), f32).read()
-    mu    = jax.nn.softplus(mu_raw   + self.haw_init_mu).astype(nn.COMPUTE_DTYPE)   # [K]
-    beta  = jax.nn.softplus(beta_raw + self.haw_init_beta).astype(nn.COMPUTE_DTYPE) # [K, K]
-    # alpha starts near zero so the model begins close to plain RSSM and
-    # learns excitation/inhibition entries as needed.
-    return mu, alpha.astype(nn.COMPUTE_DTYPE), beta
-
-  def _event_prior(self, deter, action):
-    """Causal prior p_t^pri(e_t | z_t, a_t). Returns logits [B, K]."""
-    x = jnp.concatenate([deter, action], -1)
-    for i in range(2):
-      x = self.sub(f'pri{i}', nn.Linear, self.haw_hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'pri{i}norm', nn.Norm, self.norm)(x))
-    return self.sub('prilogit', nn.Linear, self.num_events, **self.kw)(x)
-
-  def _event_post(self, deter, next_tokens, action, eps):
-    """Posterior q_t^pos(e_t | z_t, z_{t+1}, a_t, eps_t). Returns logits [B, K].
-
-    `next_tokens` is the encoder output for x_{t+1} (the obs token).
-    `eps` is the encoder-space observation delta [B, obs_dim].
-    """
-    x = jnp.concatenate([deter, next_tokens, action, eps], -1)
-    for i in range(2):
-      x = self.sub(f'pos{i}', nn.Linear, self.haw_hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'pos{i}norm', nn.Norm, self.norm)(x))
-    return self.sub('poslogit', nn.Linear, self.num_events, **self.kw)(x)
-
-  def _gatel0rd_post(self, post_input, state, training):
-    """THICK-style GateL0RD update over posterior classifier output."""
-    x = jnp.concatenate([post_input, state], -1)
-    candidate = jnp.tanh(self.sub(
-        'post_gate_candidate', nn.Linear, self.num_events, **self.kw)(x))
-    gate_pre = self.sub(
-        'post_gate_update', nn.Linear, self.num_events, **self.kw)(x)
-    if training and self.haw_gate_noise:
-      noise = jax.random.normal(
-          nj.seed(), gate_pre.shape, dtype=gate_pre.dtype)
-      gate_pre = gate_pre + self.haw_gate_noise * noise
-    gate = jax.nn.relu(jnp.tanh(gate_pre))
-    next_state = gate * candidate + (1.0 - gate) * state
-
-    # Forward: Heaviside(gate). Backward: straight-through identity gradient.
-    gate_f32 = gate.astype(f32)
-    hard_gate = sg(jnp.ceil(gate_f32)) + gate_f32 - sg(gate_f32)
-    post_logit = self.sub(
-        'post_gate_logit', nn.Linear, self.num_events, **self.kw)(next_state)
-    return nn.cast(next_state), post_logit, hard_gate
-
-  def _hawkes_embed(self, lam):
-    """h_t = MLP_omega(lambda(t)). Input [B, K], output [B, haw_embed]."""
-    x = jnp.log1p(lam)  # symlog-style compression; intensities are positive
-    for i in range(2):
-      x = self.sub(f'hemb{i}', nn.Linear, self.haw_hidden, **self.kw)(x)
-      x = nn.act(self.act)(self.sub(f'hemb{i}norm', nn.Norm, self.norm)(x))
+    x = nn.cast(jnp.stack([state, jnp.log1p(lam)], -1))
+    x = nn.act(self.act)(
+        self.sub('hemb0', nn.Linear, self.haw_hidden, **self.kw)(x))
+    x = self.sub('hemb1', nn.Linear, self.haw_hidden, **self.kw)(x)
+    x = nn.act(self.act)(self.sub('hemb1norm', nn.Norm, self.norm)(x))
     return self.sub('hembout', nn.Linear, self.haw_embed, **self.kw)(x)
 
-  # =========================================================================
-  #  Hawkes recursion (per-step, O(K^2))
-  # =========================================================================
+  def _detector(self, action, delta):
+    """pi_t from the previous action and the detached encoder delta only.
 
-  def _hawkes_step(self, S_prev, e_prev_probs, alpha, beta):
-    """One step of the exponential Hawkes recursion.
-
-    S_{k,j}(t) = exp(-beta_{k,j}) * S_{k,j}(t-1)
-                 + p_{t-1}(j) * alpha_{k,j}
-
-    where p_{t-1}(j) is the (soft) event probability at the previous step,
-    so gradients flow back through the event distribution without requiring
-    a hard sample.
-
-    Args:
-      S_prev: [B, K, K]
-      e_prev_probs: [B, K]
-      alpha, beta: [K, K]
-    Returns:
-      S_new: [B, K, K]
-      lam:   [B, K]   (intensities at the new step)
+    symlog keeps the delta scale-preserving (an RMS norm would erase the
+    magnitude that distinguishes an event); `mag` restores one unsquashed
+    scale channel.
     """
-    decay = jnp.exp(-beta)[None]               # [1, K, K]
-    increment = e_prev_probs[:, None, :] * alpha[None]  # [B, K, K]
-    S_new = decay * S_prev + increment
-    mu, _, _ = self._hawkes_params()           # mu cached separately; cheap
-    # Sum_j S_{k,j} gives the total contribution to lambda_k from past events.
-    lam_raw = mu[None] + S_new.sum(-1)         # [B, K]
-    lam = jax.nn.softplus(lam_raw)             # positivity, allows signed alpha
-    return S_new, lam
+    delta = sg(f32(delta))
+    mag = jnp.log1p(jnp.sqrt(jnp.square(delta).mean(-1) + 1e-8))
+    x = jnp.concatenate([
+        nn.cast(action),
+        nn.cast(nn.symlog(delta)),
+        nn.cast(mag)[..., None]], -1)
+    x = self.sub('det0', nn.Linear, self.haw_hidden, **self.kw)(x)
+    x = nn.act(self.act)(self.sub('det0norm', nn.Norm, self.norm)(x))
+    kw = dict(
+        **self.kw, outscale=self.haw_detector_outscale,
+        binit=_const_init(self._init_det_bias))
+    logit = self.sub('detout', nn.Linear, 1, **kw)(x)
+    return jax.nn.sigmoid(f32(logit[..., 0]))
 
-  def _hawkes_compensator(self, S_prev, alpha, beta, L):
-    """Closed-form compensator over a single step of length 1.
+  # ------------------------------------------------- observe / imagine ----
 
-    For a length-L segment, sum the per-step compensators. With unit step,
-    Lambda_k = mu_k + (alpha_{k,j}/beta_{k,j}) * (1 - exp(-beta_{k,j})) * p(j)
-    integrated tilt; we return the per-step compensator and the trainer
-    accumulates it. Returned shape: [B, K].
-    """
-    # Per-step closed form for the segment [t-1, t] with the kernel decaying
-    # from time t-1 (the event that updated S). Using the trapezoidal form:
-    # Lambda_k(unit step) = mu_k + sum_j alpha_{k,j}/beta_{k,j}
-    #                              * (1 - exp(-beta_{k,j})) * S_{k,j} / alpha_{k,j}
-    # Simplifies to mu_k + sum_j (1 - exp(-beta_{k,j})) * S_{k,j} / beta_{k,j}.
-    mu, _, _ = self._hawkes_params()
-    decayed = (1.0 - jnp.exp(-beta)) / jnp.maximum(beta, 1e-6)  # [K, K]
-    contrib = S_prev * decayed[None]                            # [B, K, K]
-    return mu[None] + contrib.sum(-1)                           # [B, K]
-
-  # =========================================================================
-  #  Top-level observe / imagine / loss — same signatures as RSSM
-  # =========================================================================
-
-  def observe(self, carry, tokens, action, reset, training, single=False):
-    carry, tokens, action = nn.cast((carry, tokens, action))
+  def observe(self, carry, tokens, action, reset, training, single=False,
+              sample_event=None):
+    sample_event = training if sample_event is None else sample_event
+    carry = dict(carry)
+    carry['deter'] = nn.cast(carry['deter'])
+    carry['stoch'] = nn.cast(carry['stoch'])
+    carry['haw_prev_obs'] = nn.cast(carry['haw_prev_obs'])
+    carry['haw_state'] = f32(carry['haw_state'])
+    carry['haw_prev'] = f32(carry['haw_prev'])
+    tokens, action = nn.cast((tokens, action))
     if single:
       carry, (entry, feat) = self._observe(
-          carry, tokens, action, reset, training)
+          carry, tokens, action, reset, training, sample_event)
       return carry, entry, feat
     else:
       unroll = jax.tree.leaves(tokens)[0].shape[1] if self.unroll else 1
       carry, (entries, feat) = nj.scan(
-          lambda c, inputs: self._observe(c, *inputs, training),
+          lambda c, inputs: self._observe(
+              c, *inputs, training, sample_event),
           carry, (tokens, action, reset), unroll=unroll, axis=1)
       return carry, entries, feat
 
-  def _observe(self, carry, tokens, action, reset, training):
-    deter, stoch, haw_state, haw_prev, prev_obs, post_state, action = nn.mask(
-        (carry['deter'], carry['stoch'], carry['haw_state'],
-         carry['haw_prev'], carry['haw_prev_obs'], carry['haw_post_state'],
-         action), ~reset)
+  def _observe(self, carry, tokens, action, reset, training, sample_event):
+    keep = ~reset
+    valid = carry['haw_prev_valid'] & keep
+    deter, stoch, haw_state, haw_prev = nn.mask(
+        (carry['deter'], carry['stoch'],
+         carry['haw_state'], carry['haw_prev']), keep)
+    action = nn.mask(action, keep)
     action = nn.DictConcat(self.act_space, 1)(action)
-    action = nn.mask(action, ~reset)
+    action = nn.mask(action, keep)
 
-    # --- Hawkes step: roll forward using p_{t-1} stored in haw_prev ----------
-    mu, alpha, beta = self._hawkes_params()
-    haw_state, lam = self._hawkes_step(haw_state, haw_prev, alpha, beta)
-    h_haw = self._hawkes_embed(lam)            # [B, haw_embed]
+    # Hawkes block: strictly t-1 information.
+    haw_state, lam, prior_prob = self._hawkes_step(
+        haw_state, haw_prev, deter, action)
+    h_haw = self._hawkes_embed(haw_state, lam)
 
-    # --- Standard RSSM core, with Hawkes context fused into the action stream
     deter = self._core(deter, stoch, action, h_haw)
-
     tokens_flat = tokens.reshape((*deter.shape[:-1], -1))
-    x = tokens_flat if self.absolute else jnp.concatenate([deter, tokens_flat], -1)
+    x = tokens_flat if self.absolute else jnp.concatenate(
+        [deter, tokens_flat], -1)
     for i in range(self.obslayers):
       x = self.sub(f'obs{i}', nn.Linear, self.hidden, **self.kw)(x)
       x = nn.act(self.act)(self.sub(f'obs{i}norm', nn.Norm, self.norm)(x))
     logit = self._logit('obslogit', x)
     stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
 
-    # --- Posterior event distribution p_t (becomes haw_prev for next step) ---
-    # Here tokens_flat is enc(o_{t+1}) and prev_obs is enc(o_t). Episode
-    # starts have no preceding transition and therefore use eps_t = 0.
-    eps = nn.mask(tokens_flat - prev_obs, ~reset)
-    post_input = self._event_post(deter, tokens_flat, action, eps)
-    post_state, post_logit, post_gate = self._gatel0rd_post(
-        post_input, post_state, training)
-    post_probs = jax.nn.softmax(post_logit, axis=-1)
-    haw_prev_next = post_probs
+    # Detector sees o_t but only reaches h_{t+1}.
+    delta = nn.mask(tokens_flat - carry['haw_prev_obs'], valid)
+    prob = jnp.where(valid, self._detector(action, delta), 0.0)
+    if sample_event:
+      draw = f32(jax.random.bernoulli(nj.seed(), prob))
+      event = sg(draw - prob) + prob
+    else:
+      event = f32(prob >= self.haw_eval_threshold)
+    event = jnp.where(valid, event, 0.0)
 
     carry = dict(
         deter=deter, stoch=stoch,
-        haw_state=haw_state, haw_prev=haw_prev_next,
-        haw_prev_obs=tokens_flat, haw_post_state=post_state)
+        haw_state=haw_state, haw_prev=event,
+        haw_prev_obs=tokens_flat,
+        # Unconditional: episode and replay boundaries are handled by `reset`
+        # and by truncate() respectively.
+        haw_prev_valid=jnp.ones_like(carry['haw_prev_valid']))
+    entry = dict(
+        deter=deter, stoch=stoch, haw_state=haw_state, haw_prev=event)
     feat = dict(
         deter=deter, stoch=stoch, logit=logit,
-        haw_lam=lam, haw_logit=post_logit, haw_embed=h_haw,
-        haw_gate=post_gate)
-    entry = dict(
-        deter=deter, stoch=stoch,
-        haw_state=haw_state, haw_prev=haw_prev_next,
-        haw_prev_obs=tokens_flat, haw_post_state=post_state)
+        haw_prob=prob, haw_event=event, haw_head_event=event,
+        haw_prior_prob=prior_prob, haw_lam=lam, haw_valid=f32(valid))
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
 
   def imagine(self, carry, policy, length, training, single=False):
-    """Imagination uses the PRIOR for event sampling — z_{t+1} is unavailable."""
     if single:
       action = policy(sg(carry)) if callable(policy) else policy
       actemb = nn.DictConcat(self.act_space, 1)(action)
-
-      # Hawkes step using haw_prev from the carry
-      mu, alpha, beta = self._hawkes_params()
-      haw_state, lam = self._hawkes_step(
-          carry['haw_state'], carry['haw_prev'], alpha, beta)
-      h_haw = self._hawkes_embed(lam)
-
+      haw_state, lam, prior_prob = self._hawkes_step(
+          carry['haw_state'], carry['haw_prev'], carry['deter'], actemb)
+      h_haw = self._hawkes_embed(haw_state, lam)
       deter = self._core(carry['deter'], carry['stoch'], actemb, h_haw)
       logit = self._prior(deter)
       stoch = nn.cast(self._dist(logit).sample(seed=nj.seed()))
-
-      # Use the PRIOR to draw the event distribution for the NEXT step
-      pri_logit = self._event_prior(deter, actemb)
-      pri_probs = jax.nn.softmax(pri_logit, axis=-1)
-
-      carry = nn.cast(dict(
-          deter=deter, stoch=stoch,
-          haw_state=haw_state, haw_prev=pri_probs,
-          haw_prev_obs=carry['haw_prev_obs'],
-          haw_post_state=carry['haw_post_state']))
-      feat = nn.cast(dict(
+      # Hard draw keeps the imagined event history on-distribution. No
+      # straight-through: imagined features are detached before actor/critic.
+      event = f32(jax.random.bernoulli(nj.seed(), prior_prob))
+      carry = dict(
+          deter=deter, stoch=stoch, haw_state=haw_state, haw_prev=event)
+      feat = dict(
           deter=deter, stoch=stoch, logit=logit,
-          haw_lam=lam, haw_logit=pri_logit, haw_embed=h_haw,
-          # Imagination uses the causal event prior, not the posterior
-          # GateL0RD path. Keep a zero placeholder so observed and imagined
-          # feature pytrees remain compatible when Agent.loss concatenates.
-          haw_gate=jnp.zeros_like(pri_probs)))
+          haw_prob=prior_prob, haw_event=event,
+          # Marginalization weight for the reward/cont heads: keeps their
+          # input on the {0,1} support they were trained on, without the
+          # return noise of a hard sample.
+          haw_head_event=prior_prob,
+          haw_prior_prob=prior_prob, haw_lam=lam,
+          haw_valid=jnp.ones_like(prior_prob))
+      assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
       return carry, (feat, action)
     else:
       unroll = length if self.unroll else 1
+      # Drop the observation-only fields: report() hands us a full observe
+      # carry, and the scan carry structure has to match what _observe of the
+      # imagined step returns.
+      carry = dict(
+          deter=nn.cast(carry['deter']),
+          stoch=nn.cast(carry['stoch']),
+          haw_state=f32(carry['haw_state']),
+          haw_prev=f32(carry['haw_prev']))
       if callable(policy):
         carry, (feat, action) = nj.scan(
             lambda c, _: self.imagine(c, policy, 1, training, single=True),
-            nn.cast(carry), (), length, unroll=unroll, axis=1)
+            carry, (), length, unroll=unroll, axis=1)
       else:
         carry, (feat, action) = nj.scan(
             lambda c, a: self.imagine(c, a, 1, training, single=True),
-            nn.cast(carry), nn.cast(policy), length, unroll=unroll, axis=1)
+            carry, nn.cast(policy), length, unroll=unroll, axis=1)
       return carry, feat, action
 
-  def loss(self, carry, tokens, acts, reset, training, extras=None):
-    """Compute world-model losses including the Hawkes terms.
+  # ------------------------------------------------------------------ loss --
 
-    `extras` is an optional dict that may contain a privileged event label
-    tensor under key 'event_label' of shape [B, T] with integer entries in
-    [0, K). When present and self.haw_use_supervision is True, we add a
-    cross-entropy term to push the posterior toward the labels.
-    """
+  def loss(self, carry, tokens, acts, reset, training):
     metrics = {}
-    carry, entries, feat = self.observe(carry, tokens, acts, reset, training)
+    # Snapshot before observe() advances the carry; the fitting recurrence
+    # below must start from the same place.
+    init_state = f32(carry['haw_state'])
+    init_event = f32(carry['haw_prev'])
+    init_deter = nn.cast(carry['deter'])
+
+    carry, entries, feat = self.observe(
+        carry, tokens, acts, reset, training, sample_event=training)
     prior = self._prior(feat['deter'])
     post = feat['logit']
     dyn = self._dist(sg(post)).kl(self._dist(prior))
@@ -378,76 +340,81 @@ class HawkesRSSM(nj.Module):
     metrics['dyn_ent'] = self._dist(prior).entropy().mean()
     metrics['rep_ent'] = self._dist(post).entropy().mean()
 
-    # ── Hawkes losses ────────────────────────────────────────────────────────
-    # Event prior p_t^pri evaluated at the SAME (deter, action) used to
-    # produce the posterior, so the KL is well-defined per step.
-    actemb = nn.DictConcat(self.act_space, 1)(acts)
-    pri_logit = self._event_prior(feat['deter'], actemb)
-    post_logit = feat['haw_logit']
-    lam = feat['haw_lam']                                  # [B, T, K]
+    valid = feat['haw_valid']            # [B, T] f32 in {0, 1}
+    prob = feat['haw_prob']              # [B, T] f32
+    nvalid = jnp.maximum(1.0, valid.sum())
 
-    # Sample e_t differentiably from the posterior
-    g = -jnp.log(-jnp.log(jax.random.uniform(
-        nj.seed(), post_logit.shape, minval=1e-9, maxval=1.0)))
-    e_soft = jax.nn.softmax(
-        (post_logit + g) / self.haw_gumbel_tau, axis=-1)   # [B, T, K]
+    # Event-rate budget. Two-sided: KL(Ber(rho) || Ber(mean pi)) diverges as
+    # the rate goes to zero, so a collapsing detector is pushed back up.
+    rho = float(self.haw_target_rate)
+    clip = float(self.haw_rate_clip)
+    rate = (valid * prob).sum() / nvalid
+    rate_c = jnp.clip(rate, clip, 1.0 - clip)
+    rate_kl = (
+        rho * (np.log(rho) - jnp.log(rate_c)) +
+        (1.0 - rho) * (np.log1p(-rho) - jnp.log1p(-rate_c)))
+    losses['event_rate'] = jnp.broadcast_to(rate_kl, prob.shape)
 
-    # L_haw = -sum_t log lambda_{e_t}(t) + sum_k Lambda_k
-    log_lam = jnp.log(lam + 1e-8)
-    nll = -(e_soft * log_lam).sum(-1)                       # [B, T]
-    # Compensator: per-step closed form, summed over the segment.
-    # We stored S_{k,j} in entries; reconstruct the per-step compensator by
-    # using a stop-gradient copy to avoid double-counting through S.
-    mu, alpha, beta = self._hawkes_params()
-    S = entries['haw_state']                                # [B, T, K, K]
-    decayed = (1.0 - jnp.exp(-beta)) / jnp.maximum(beta, 1e-6)
-    comp = mu[None, None] + (S * decayed[None, None]).sum(-1)  # [B, T, K]
-    losses['haw'] = nll + comp.sum(-1)                          # [B, T]
+    # Detached fitting recurrence: same forward values as the live one, but
+    # event history and deter are detached so this trains only b/alpha/beta/eta.
+    acts_m = nn.mask(acts, ~reset)
+    actemb = nn.DictConcat(self.act_space, 1)(acts_m)
+    actemb = nn.mask(actemb, ~reset)
+    prepend = lambda init, x: jnp.concatenate([init[:, None], x[:, :-1]], 1)
+    prev_event = sg(prepend(init_event, feat['haw_event']))
+    prev_deter = sg(prepend(init_deter, feat['deter']))
+    # Must reuse the live path's ~reset mask on M, y, h and a, or lambda_fit
+    # and lambda_model diverge at every episode boundary inside the batch.
+    ctx = self._context(nn.mask(prev_deter, ~reset), actemb)
 
-    # L_kl: KL-balanced posterior <-> prior
-    pri_lp = jax.nn.log_softmax(pri_logit, axis=-1)
-    post_p = jax.nn.softmax(post_logit, axis=-1)
-    post_lp = jax.nn.log_softmax(post_logit, axis=-1)
-    kl_post_pri = (post_p * (post_lp - sg(pri_lp))).sum(-1)
-    kl_post_pri_sg = (sg(post_p) * (sg(post_lp) - pri_lp)).sum(-1)
-    losses['haw_kl'] = (
-        kl_post_pri_sg + self.haw_kl_balance * kl_post_pri)
+    base, alpha, beta = self._haw_params()
+    decay = jnp.exp(-beta)
 
-    # L_ent: entropy regularization with a soft floor at haw_ent_target
-    ent = -(post_p * post_lp).sum(-1)
-    losses['haw_ent'] = jnp.maximum(0.0, self.haw_ent_target - ent)
+    def fit_step(state, xs):
+      y_prev, k = xs
+      state = jnp.where(k, state, 0.0)
+      y_prev = jnp.where(k, y_prev, 0.0)
+      state = decay * state + alpha * y_prev
+      return state, state
 
-    # THICK GateL0RD L0 loss. Keep [B, T] for Agent.loss and apply its
-    # configured scale exactly once in the common loss aggregation.
-    post_gate = feat['haw_gate']                              # [B, T, K]
-    losses['haw_sparse'] = post_gate.mean(-1)                # [B, T]
+    _, mfit = jax.lax.scan(
+        fit_step, init_state,
+        (prev_event.swapaxes(0, 1), (~reset).swapaxes(0, 1)))
+    mfit = mfit.swapaxes(0, 1)
+    lam_fit = jax.nn.softplus(base + mfit + ctx)
+    p_fit = -jnp.expm1(-lam_fit)
 
-    # Optional L_sup: cross-entropy against privileged labels
-    if self.haw_use_supervision and extras and 'event_label' in extras:
-      labels = extras['event_label']                         # [B, T] int
-      one_hot = jax.nn.one_hot(labels, self.num_events)
-      losses['haw_sup'] = -(one_hot * post_lp).sum(-1)
-      metrics['haw_sup_acc'] = (
-          post_p.argmax(-1) == labels).mean().astype(f32)
-    else:
-      losses['haw_sup'] = jnp.zeros_like(losses['haw'])
+    q = jnp.clip(sg(prob), 1e-6, 1.0 - 1e-6)
+    p = jnp.clip(p_fit, 1e-6, 1.0 - 1e-6)
+    losses['haw'] = valid * (
+        q * (jnp.log(q) - jnp.log(p)) +
+        (1.0 - q) * (jnp.log1p(-q) - jnp.log1p(-p)))
 
-    # Metrics
-    metrics['haw_lam_mean'] = lam.mean()
-    metrics['haw_lam_max'] = lam.max()
-    metrics['haw_post_ent'] = ent.mean()
-    metrics['haw_gate_activity'] = post_gate.mean()
-    metrics['haw_gate_open_frac'] = (
-        post_gate.sum(-1) > 0).mean().astype(f32)
-    metrics['haw_alpha_abs_mean'] = jnp.abs(alpha).mean()
-    metrics['haw_beta_mean'] = beta.mean()
-    metrics['haw_inhibition_frac'] = (alpha < 0).mean().astype(f32)
+    wmean = lambda x: (valid * x).sum() / nvalid
+    metrics['haw_rate'] = rate
+    metrics['haw_rate_error'] = rate - rho
+    metrics['haw_event_rate'] = wmean(feat['haw_event'])
+    metrics['haw_prior_rate'] = wmean(feat['haw_prior_prob'])
+    metrics['haw_post_prior_gap'] = wmean(
+        jnp.abs(prob - feat['haw_prior_prob']))
+    metrics['haw_prob_ent'] = wmean(
+        -(q * jnp.log(q) + (1.0 - q) * jnp.log1p(-q)))
+    metrics['haw_prob_std_time'] = prob.std(1).mean()
+    metrics['haw_lam_mean'] = wmean(feat['haw_lam'])
+    metrics['haw_lam_max'] = feat['haw_lam'].max()
+    metrics['haw_ctx_std'] = ctx.std()
+    metrics['haw_base'] = base
+    metrics['haw_alpha'] = alpha
+    metrics['haw_beta'] = beta
+    metrics['haw_valid_frac'] = valid.mean()
+    # Live guard on the fitting invariant; nonzero means a misalignment in
+    # prepend, the reset mask, or the initial carry.
+    metrics['haw_lam_fit_err'] = (
+        valid * jnp.abs(lam_fit - feat['haw_lam'])).max()
 
     return carry, entries, losses, feat, metrics
 
-  # =========================================================================
-  #  Core (GRU) — extended to take h_t^haw as a third input stream
-  # =========================================================================
+  # ------------------------------------------------------------------ core --
 
   def _core(self, deter, stoch, action, h_haw=None):
     stoch = stoch.reshape((stoch.shape[0], -1))
@@ -465,6 +432,8 @@ class HawkesRSSM(nj.Module):
 
     streams = [x0, x1, x2]
     if h_haw is not None:
+      # Norm kept here: input is `hidden`-dimensional, so it balances this
+      # stream against the other three without erasing the direction.
       x3 = self.sub('dynin3', nn.Linear, self.hidden, **self.kw)(h_haw)
       x3 = nn.act(self.act)(self.sub('dynin3norm', nn.Norm, self.norm)(x3))
       streams.append(x3)
