@@ -55,8 +55,18 @@ model's own forward pass.
 ## Usage
 
 ```bash
-python -m dreamerv3.main --configs mshab hawkes --task maniskill_PickSubtaskTrain-v0
+python -m dreamerv3.main \
+  --configs maniskill_rgb mshab hawkes \
+  --task maniskill_PickSubtaskTrain-v0 \
+  --env.maniskill.obs_mode rgb \
+  --env.maniskill.control_mode pd_joint_delta_pos \
+  --env.maniskill.mshab_task tidy_house
 ```
+
+`--env.maniskill.mshab_task` is required: it defaults to `none`, and the
+`mshab` preset does not set it. Without it the env wrapper never imports
+`mshab.envs`, so the `*SubtaskTrain-v0` ids are never registered and
+`gym.make` raises `NameNotFound`.
 
 Disable with `--run.eval_event_log False`.
 
