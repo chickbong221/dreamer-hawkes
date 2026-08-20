@@ -315,9 +315,9 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
            'haw_prob' in outs:
           for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
             event_data[key].append(float(_to_numpy(outs[key])[0]))
-          for key in ('depth_head', 'depth_hand'):
+          for key in ('image', 'depth_head', 'depth_hand'):
             if key in obs:
-              event_data[key].append(obs[key][0].copy())
+              event_data[key].append(_to_numpy(obs[key][0]).copy())
 
         if done.any():
           mask = ~done

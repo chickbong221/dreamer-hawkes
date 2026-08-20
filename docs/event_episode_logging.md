@@ -30,7 +30,7 @@ training metric is deliberately not logged here.
 |---|---|---|
 | `event/probs` | Line | `pi_t` and `p_haw_t` over the episode, one chart |
 | `event/spike_trace` | Image | `[1 x T]` strip, red where an event fired |
-| `event/episode_video` | Video | `depth_head \| depth_hand` mp4, red top border on spike frames |
+| `event/episode_video` | Video | mp4 of the episode with a bar above the frame, red on spike steps |
 | `event/hard_count` | Scalar | events in the episode |
 | `event/expected_count` | Scalar | `sum(pi_t)` |
 
@@ -39,9 +39,10 @@ of it, so it would be the same curve twice. The learned `b / alpha / beta` are
 not plotted either — they are static parameters already logged as training
 metrics.
 
-`event/episode_video` appears only when the observation carries `depth_head`,
-which means mshab depth tasks. On plain ManiSkill RGB tasks the other four
-panels still appear.
+`event/episode_video` uses whichever frames the observation carries: `image`
+on RGB tasks (cameras flattened into channels are tiled horizontally) or
+`depth_head` / `depth_hand` on mshab depth tasks. If neither is present the
+other four panels still appear.
 
 ## Capture path
 
@@ -51,6 +52,9 @@ panels still appear.
 replay, and `agent.train()` asserts the per-batch keys equal `self.spaces`
 exactly, so extra fields there would break training. `mode` is a
 `static_argnums` argument, so the branch is compiled away.
+
+`embodied/run/train.py` pairs those three scalars with the `image` /
+`depth_head` / `depth_hand` frames from the same steps.
 
 Policy outputs are already host-side (`fetch_async`). Anything read from
 `agent.params` is not, and `jax_transfer_guard` is set to `disallow`, so an

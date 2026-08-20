@@ -37,6 +37,36 @@ def _depth_to_rgb(depth_u16, max_depth):
   return np.stack([gray, gray, gray], axis=-1)
 
 
+def _rgb_to_frames(images):
+  """uint8 [T, H, W, C] -> [T, H, W*views, 3], tiling cameras horizontally."""
+  x = np.asarray(images, np.uint8)
+  c = x.shape[-1]
+  if c == 1:
+    return np.repeat(x, 3, axis=-1)
+  if c == 3:
+    return x
+  if c % 3 == 0:  # several cameras flattened into channels
+    t, h, w, _ = x.shape
+    x = x.reshape(t, h, w, c // 3, 3).transpose(0, 1, 3, 2, 4)
+    return x.reshape(t, h, (c // 3) * w, 3)
+  return x[..., :3]
+
+
+def _episode_frames(data, T, max_depth):
+  """Best available RGB frames for the episode, or None."""
+  if 'image' in data:
+    return _rgb_to_frames(np.asarray(data['image'])[:T])
+  if 'depth_head' in data:
+    head = np.stack(
+        [_depth_to_rgb(f, max_depth) for f in data['depth_head'][:T]], 0)
+    if 'depth_hand' in data:
+      hand = np.stack(
+          [_depth_to_rgb(f, max_depth) for f in data['depth_hand'][:T]], 0)
+      return np.concatenate([head, hand], axis=2)
+    return head
+  return None
+
+
 def build_event_episode_payload(agent, data, max_depth=None):
   """Build binary-event panels from an episode captured by the eval loop.
 
@@ -96,21 +126,17 @@ def build_event_episode_payload(agent, data, max_depth=None):
       _upscale(strip, 24, T * 6),
       caption=f'{int(spikes.sum())} events in {T} steps')
 
-  if 'depth_head' in data:
-    head = np.stack(
-        [_depth_to_rgb(f, max_depth) for f in data['depth_head'][:T]], 0)
-    if 'depth_hand' in data:
-      hand = np.stack(
-          [_depth_to_rgb(f, max_depth) for f in data['depth_hand'][:T]], 0)
-      frames = np.concatenate([head, hand], axis=2)
-    else:
-      frames = head
-    pad = 6
+  # Episode video with an event bar above the frame: dark grey normally, red
+  # on the steps where an event fired.
+  frames = _episode_frames(data, T, max_depth)
+  if frames is not None:
+    bar = 8
     frames = np.concatenate(
-        [np.zeros((T, pad, frames.shape[2], 3), np.uint8), frames], axis=1)
-    frames[spikes, :pad] = np.array([255, 0, 0], np.uint8)
+        [np.zeros((T, bar, frames.shape[2], 3), np.uint8), frames], axis=1)
+    frames[:, :bar] = np.array([40, 40, 48], np.uint8)
+    frames[spikes, :bar] = np.array([255, 40, 40], np.uint8)
     payload['event/episode_video'] = wandb.Video(
         frames.transpose(0, 3, 1, 2), fps=10, format='mp4',
-        caption='depth_head | depth_hand; red top border = event')
+        caption=f'red bar = event ({int(spikes.sum())} of {T} steps)')
 
   return payload
