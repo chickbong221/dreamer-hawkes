@@ -109,6 +109,7 @@ class HawkesRSSM(nj.Module):
     assert self.deter % self.blocks == 0
     assert 0.0 < self.haw_target_rate < 1.0, self.haw_target_rate
     assert self.haw_types >= 2, self.haw_types
+    assert self.haw_type_temp > 0.0, self.haw_type_temp  # divides the logits
     # _event_repr takes a log; the unimix floor is what keeps it finite.
     assert self.unimix > 0.0, self.unimix
     self.act_space = act_space
@@ -463,12 +464,16 @@ class HawkesRSSM(nj.Module):
     # partition useful rather than merely confident and balanced.
     K = self.haw_types
     w = sg(valid * prob)                                   # [B, T]
-    wsum = w.sum() + 1e-8
     acl = jnp.clip(feat['haw_type_prob_sg'], 1e-8, 1.0)    # [B, T, K]
+    mass = (w[..., None] * acl).sum((0, 1))                # [K]
+    total = mass.sum()
+    # An all-reset batch carries no event mass. Fall back to the uniform
+    # assignment: both terms then evaluate to exactly zero rather than 0/0,
+    # whose NaN would silently poison every gradient in the step.
+    denom = jnp.maximum(total, 1e-8)
+    abar = jnp.where(total > 0, mass / denom, jnp.full_like(mass, 1.0 / K))
     losses['event_conf'] = bcast(
-        (w * -(acl * jnp.log(acl)).sum(-1)).sum() / wsum)
-    abar = (w[..., None] * acl).sum((0, 1)) / wsum
-    abar = abar / abar.sum()
+        (w * -(acl * jnp.log(acl)).sum(-1)).sum() / denom)
     losses['event_use'] = bcast(
         (abar * (jnp.log(abar) + np.log(K))).sum())
 

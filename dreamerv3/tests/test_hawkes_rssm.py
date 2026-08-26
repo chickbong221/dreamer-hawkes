@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
+import pytest
 
 import embodied.jax.nets as nn
 
@@ -334,7 +335,6 @@ _is_type = lambda k: '/typeout' in k
 # Per-channel weights, so the reduction is not blind to the type the way a
 # plain sum over a straight-through one-hot is.
 _weighted = lambda x: (f32(x) * (1.0 + jnp.arange(x.shape[-1], dtype=f32))).sum()
-_is_trunk = lambda k: '/ctx' in k or 'haw_' in k
 
 
 class TestGradientRouting:
@@ -375,12 +375,15 @@ class TestGradientRouting:
       n = _grad_norms(lambda los, feat: los[key].mean(), _is_type)
       assert n > 0.0, (key, n)
 
-  def test_cluster_losses_do_not_touch_the_shared_trunk(self):
+  def test_cluster_losses_touch_nothing_but_the_type_readout(self):
     """Both u_t and the event weights are detached in these losses, so they
-    cannot reshape the detector to manufacture easy clusters."""
+    cannot reshape the detector to manufacture easy clusters. Asserted over
+    every parameter outside `typeout`, not a hand-listed subset.
+    """
     for key in ('event_conf', 'event_use'):
-      assert _grad_norms(lambda los, feat: los[key].mean(), _is_trunk) == 0.0, key
-      assert _grad_norms(lambda los, feat: los[key].mean(), _is_rssm) == 0.0, key
+      n = _grad_norms(
+          lambda los, feat: los[key].mean(), lambda k: not _is_type(k))
+      assert n == 0.0, (key, n)
 
   def test_typed_event_trains_the_type_readout(self):
     """Downstream utility, unlike the cluster losses, does reach typeout.
@@ -512,6 +515,24 @@ class TestLosses:
     want = (valid * prob).sum() / max(valid.sum(), 1.0)
     assert np.allclose(float(mets['event_rate_obs']), want, atol=1e-6)
     assert np.isclose(float(mets['haw_valid_frac']), valid.mean())
+
+  def test_all_reset_batch_keeps_the_losses_finite(self):
+    """No event mass anywhere: the usage term must fall back to uniform
+    rather than divide zero by zero."""
+    losses, feat, mets = run_loss(make_dyn(), resets=tuple(range(T)))
+    assert np.allclose(np.asarray(feat['haw_valid']), 0.0)
+    for key, value in losses.items():
+      assert np.isfinite(np.asarray(value, np.float32)).all(), key
+    assert np.allclose(np.asarray(losses['event_use']), 0.0)
+    assert np.allclose(np.asarray(losses['event_conf']), 0.0)
+    assert np.isfinite(
+        np.asarray([float(v) for v in mets.values()], np.float32)).all()
+    assert np.isclose(
+        float(mets['event_type_effective_count']), TYPES, atol=1e-4)
+
+  def test_type_temperature_must_be_positive(self):
+    with pytest.raises(AssertionError):
+      make_dyn(haw_type_temp=0.0)
 
   def test_rate_loss_is_two_sided(self):
     """A collapsed event model must be pushed up, not further down."""
