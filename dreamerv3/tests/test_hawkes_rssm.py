@@ -331,6 +331,9 @@ _is_evt = lambda k: any(
 _is_rssm = lambda k: any(
     s in k for s in ('/dynin', '/dynhid', '/dyngru', '/obs', '/prior'))
 _is_type = lambda k: '/typeout' in k
+# Per-channel weights, so the reduction is not blind to the type the way a
+# plain sum over a straight-through one-hot is.
+_weighted = lambda x: (f32(x) * (1.0 + jnp.arange(x.shape[-1], dtype=f32))).sum()
 _is_trunk = lambda k: '/ctx' in k or 'haw_' in k
 
 
@@ -347,8 +350,10 @@ class TestGradientRouting:
     assert n == 0.0, n
 
   def test_typed_event_trains_the_event_model(self):
-    """The observed route the reward and continuation heads use."""
-    n = _grad_norms(lambda los, feat: feat['haw_type'].sum(), _is_evt)
+    """The observed route the reward and continuation heads use. The
+    binary half of it: sum_k of y c is exactly y.
+    """
+    n = _grad_norms(lambda los, feat: _weighted(feat['haw_type']), _is_evt)
     assert n > 0.0, n
 
   def test_delayed_world_model_path_trains_the_event_model(self):
@@ -360,7 +365,7 @@ class TestGradientRouting:
   def test_delayed_path_is_not_vanishing(self):
     """Guard against a dead omega: compare against the direct head route."""
     direct = _grad_norms(
-        lambda los, feat: feat['haw_type'].sum(), _is_evt)
+        lambda los, feat: _weighted(feat['haw_type']), _is_evt)
     delayed = _grad_norms(
         lambda los, feat: feat['deter'][:, 2:].astype(f32).sum(), _is_evt)
     assert delayed > 1e-4 * direct, (delayed, direct)
@@ -378,9 +383,22 @@ class TestGradientRouting:
       assert _grad_norms(lambda los, feat: los[key].mean(), _is_rssm) == 0.0, key
 
   def test_typed_event_trains_the_type_readout(self):
-    """Downstream utility, unlike the cluster losses, does reach typeout."""
-    n = _grad_norms(lambda los, feat: feat['haw_type'].sum(), _is_type)
+    """Downstream utility, unlike the cluster losses, does reach typeout.
+
+    Reduced with per-channel weights, as any real consumer does: `_headfeat`
+    concatenates y c into the head input and `_hawkes_embed` into omega, so
+    each type meets a different column of the next kernel.
+    """
+    n = _grad_norms(lambda los, feat: _weighted(feat['haw_type']), _is_type)
     assert n > 0.0, n
+
+  def test_summing_the_typed_event_over_types_is_gradient_free(self):
+    """sum_k of a straight-through one-hot is identically 1 -- sg(hard) plus
+    probs minus sg(probs). A consumer that only sees the total mass gets no
+    type gradient, which is why the test above weights the channels.
+    """
+    n = _grad_norms(lambda los, feat: feat['haw_type'].sum(), _is_type)
+    assert n == 0.0, n
 
   def test_delta_is_detached(self):
     """dr_t is stop-gradded, so nothing flows back into the logit heads
