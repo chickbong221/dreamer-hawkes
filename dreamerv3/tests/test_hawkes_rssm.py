@@ -1,4 +1,4 @@
-"""Invariant tests for the binary-event Hawkes RSSM.
+"""Invariant tests for the latent-conditioned Hawkes RSSM.
 
 Run with:  python -m pytest dreamerv3/tests/test_hawkes_rssm.py -v
 
@@ -7,11 +7,11 @@ something; production runs use bfloat16 for activations only.
 """
 
 import elements
+import embodied.jax
 import jax
 import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
-import pytest
 
 import embodied.jax.nets as nn
 
@@ -20,13 +20,14 @@ nn.COMPUTE_DTYPE = jnp.float32
 from dreamerv3.hawkes_rssm import HawkesRSSM  # noqa: E402
 
 B, T, OBS, ACT = 3, 6, 12, 4
+DETER, STOCH, CLASSES, UNIMIX = 32, 4, 4, 0.01
 f32 = jnp.float32
 
 
 def make_dyn(**kw):
   base = dict(
-      obs_dim=OBS, deter=32, hidden=16, stoch=4, classes=4, blocks=4,
-      act='silu', norm='rms', haw_hidden=16, haw_embed=8,
+      deter=DETER, hidden=16, stoch=STOCH, classes=CLASSES, blocks=4,
+      act='silu', norm='rms', unimix=UNIMIX, haw_hidden=16, haw_embed=8,
       haw_context_hidden=8, haw_target_rate=0.1)
   base.update(kw)
   act_space = {'action': elements.Space(np.float32, (ACT,), -1, 1)}
@@ -49,121 +50,187 @@ def init_and_run(fn, *args, seed=0):
   return nj.pure(fn)(params, *args, seed=seed)
 
 
+def observe(dyn, tokens, acts, reset, training=True, **kw):
+  def fn(tokens, acts, reset):
+    carry = dyn.initial(B)
+    return dyn.observe(carry, tokens, acts, reset, training=training, **kw)
+  return init_and_run(fn, tokens, acts, reset)[1]
+
+
 # ---------------------------------------------------------------------------
-# Shapes, values, reset and validity handling
+# Canonical latent representation
+# ---------------------------------------------------------------------------
+
+class TestEventRepr:
+
+  def _repr(self, logit, **kw):
+    dyn = make_dyn(**kw)
+    return np.asarray(init_and_run(lambda l: dyn._event_repr(l), logit)[1])
+
+  def test_matches_dreamer_unimixed_categorical(self):
+    logit = jnp.asarray(
+        np.random.RandomState(0).normal(0, 3, (B, STOCH, CLASSES)), f32)
+    want = embodied.jax.outs.Categorical(logit, UNIMIX).logits
+    assert np.allclose(self._repr(logit), np.asarray(want), atol=1e-6)
+
+  def test_is_invariant_to_a_constant_logit_shift(self):
+    """softmax(l) == softmax(l + c): a shift must not read as a change."""
+    logit = jnp.asarray(
+        np.random.RandomState(1).normal(0, 3, (B, STOCH, CLASSES)), f32)
+    shift = jnp.asarray(
+        np.random.RandomState(2).normal(0, 5, (B, STOCH, 1)), f32)
+    assert np.allclose(self._repr(logit), self._repr(logit + shift), atol=1e-5)
+    # Sanity: a non-constant perturbation does move it.
+    noise = jnp.asarray(
+        np.random.RandomState(3).normal(0, 1, logit.shape), f32)
+    assert not np.allclose(self._repr(logit), self._repr(logit + noise))
+
+  def test_is_finite_at_saturated_logits(self):
+    logit = jnp.full((B, STOCH, CLASSES), -1e4, f32).at[..., 0].set(1e4)
+    out = self._repr(logit)
+    assert np.isfinite(out).all()
+    assert out.min() >= np.log(UNIMIX / CLASSES) - 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Shapes, values, and the two masks
 # ---------------------------------------------------------------------------
 
 class TestShapesAndMasking:
 
-  def _feat(self, training=True, resets=(0,)):
-    dyn = make_dyn()
-    tokens, acts, reset = make_batch(resets=resets)
-
-    def fn(tokens, acts, reset):
-      carry = dyn.initial(B)
-      return dyn.observe(carry, tokens, acts, reset, training=training)
-
-    _, (_, _, feat) = init_and_run(fn, tokens, acts, reset)
-    return feat, np.asarray(reset)
-
   def test_scalar_features_are_bt(self):
-    feat, _ = self._feat()
-    for key in ('haw_prob', 'haw_event', 'haw_prior_prob', 'haw_lam',
-                'haw_valid', 'haw_head_event'):
+    _, _, feat = observe(make_dyn(), *make_batch())
+    for key in ('haw_prob', 'haw_event', 'haw_lam', 'haw_ctx',
+                'haw_delta_mag', 'haw_valid'):
       assert feat[key].shape == (B, T), (key, feat[key].shape)
       assert feat[key].dtype == f32, (key, feat[key].dtype)
 
   def test_hard_events_are_binary(self):
-    feat, _ = self._feat()
+    _, _, feat = observe(make_dyn(), *make_batch(), training=False,
+                         sample_event=True)
     ev = np.asarray(feat['haw_event'])
-    assert np.all((ev == 0.0) | (ev == 1.0)), np.unique(ev)
+    assert np.isin(ev, (0.0, 1.0)).all(), np.unique(ev)
 
-  def test_probabilities_are_open_interval(self):
-    feat, _ = self._feat()
-    for key in ('haw_prob', 'haw_prior_prob'):
-      v = np.asarray(feat[key])
-      assert np.isfinite(v).all()
-      assert (v >= 0).all() and (v <= 1).all(), (key, v.min(), v.max())
-    prior = np.asarray(feat['haw_prior_prob'])
-    assert (prior > 0).all() and (prior < 1).all()
+  def test_probabilities_are_in_the_open_interval(self):
+    _, _, feat = observe(make_dyn(), *make_batch(resets=()))
+    prob = np.asarray(feat['haw_prob'])
+    assert (prob > 0).all() and (prob < 1).all()
     assert np.isfinite(np.asarray(feat['haw_lam'])).all()
 
-  def test_first_episode_step_has_no_event(self):
-    feat, reset = self._feat(resets=(0,))
-    assert np.allclose(np.asarray(feat['haw_valid'])[reset], 0.0)
-    assert np.allclose(np.asarray(feat['haw_prob'])[reset], 0.0)
-    assert np.allclose(np.asarray(feat['haw_event'])[reset], 0.0)
+  def test_reset_masks_both_probability_and_event(self):
+    """An episode start is not a transition, so it cannot be an event."""
+    _, _, feat = observe(make_dyn(), *make_batch(resets=(0, 3)))
+    for key in ('haw_prob', 'haw_event', 'haw_lam'):
+      col = np.asarray(feat[key])
+      assert np.allclose(col[:, [0, 3]], 0.0), key
+    assert np.allclose(np.asarray(feat['haw_valid'])[:, [0, 3]], 0.0)
+    assert np.allclose(np.asarray(feat['haw_valid'])[:, [1, 2, 4, 5]], 1.0)
 
-  def test_mid_batch_reset_is_invalid_and_next_step_recovers(self):
-    feat, _ = self._feat(resets=(0, 3))
-    valid = np.asarray(feat['haw_valid'])
-    assert np.allclose(valid[:, 0], 0.0)
-    assert np.allclose(valid[:, 3], 0.0)
-    assert np.allclose(valid[:, 4], 1.0)
-    assert np.allclose(valid[:, 1], 1.0)
+  def test_invalid_delta_does_not_invalidate_the_event(self):
+    """Step 0 of a fresh carry has no previous r, but still predicts."""
+    _, _, feat = observe(make_dyn(), *make_batch(resets=()))
+    mag = np.asarray(feat['haw_delta_mag'])
+    # log1p(sqrt(1e-8)) is the floor `_delta` returns for a zeroed delta.
+    assert (mag[:, 0] < 1e-3).all(), mag[:, 0]
+    assert (mag[:, 1:] > 1e-2).all(), mag
+    assert (np.asarray(feat['haw_prob'])[:, 0] > 0).all()
+    assert np.allclose(np.asarray(feat['haw_valid'])[:, 0], 1.0)
 
   def test_eval_mode_thresholds_deterministically(self):
     dyn = make_dyn(haw_eval_threshold=0.5)
-    tokens, acts, reset = make_batch()
-
-    def fn(tokens, acts, reset):
-      carry = dyn.initial(B)
-      return dyn.observe(
-          carry, tokens, acts, reset, training=False, sample_event=False)
-
-    _, (_, _, feat) = init_and_run(fn, tokens, acts, reset)
+    _, _, feat = observe(
+        dyn, *make_batch(), training=False, sample_event=False)
     prob = np.asarray(feat['haw_prob'])
-    ev = np.asarray(feat['haw_event'])
-    valid = np.asarray(feat['haw_valid']).astype(bool)
-    expect = (prob >= 0.5).astype(np.float32) * valid
-    assert np.allclose(ev, expect)
+    valid = np.asarray(feat['haw_valid'])
+    assert np.allclose(
+        np.asarray(feat['haw_event']), (prob >= 0.5).astype(np.float32) * valid)
+
+  def test_event_quantities_stay_float32_under_bfloat16(self):
+    old = nn.COMPUTE_DTYPE
+    nn.COMPUTE_DTYPE = jnp.bfloat16
+    try:
+      carry, _, feat = observe(make_dyn(), *make_batch())
+    finally:
+      nn.COMPUTE_DTYPE = old
+    for key in ('haw_prob', 'haw_lam', 'haw_ctx', 'haw_delta_mag'):
+      assert feat[key].dtype == jnp.float32, (key, feat[key].dtype)
+    assert carry['haw_prev_repr'].dtype == jnp.float32
+    assert carry['haw_state'].dtype == jnp.float32
 
 
 # ---------------------------------------------------------------------------
 # Replay carry contract
 # ---------------------------------------------------------------------------
 
+def make_entries(steps=T):
+  return {
+      'deter': jnp.ones((B, steps, DETER), f32),
+      'stoch': jnp.ones((B, steps, STOCH, CLASSES), f32),
+      'haw_state': jnp.full((B, steps), 0.7, f32),
+      'haw_lam': jnp.full((B, steps), 0.3, f32)}
+
+
 class TestCarryContract:
 
-  def test_entry_space_excludes_previous_tokens(self):
-    dyn = make_dyn()
-    keys = set(dyn.entry_space.keys())
-    assert keys == {'deter', 'stoch', 'haw_state', 'haw_prev'}, keys
+  def test_entry_space_excludes_the_previous_representation(self):
+    keys = set(make_dyn().entry_space.keys())
+    assert keys == {'deter', 'stoch', 'haw_state', 'haw_lam'}, keys
 
-  def test_truncate_marks_boundary_invalid(self):
+  def test_truncate_zeroes_the_delta_and_keeps_the_hawkes_state(self):
     dyn = make_dyn()
-    carry = jax.tree.map(lambda x: x, dyn.initial(B))
-    entries = {
-        'deter': jnp.ones((B, 2, 32), f32),
-        'stoch': jnp.ones((B, 2, 4, 4), f32),
-        'haw_state': jnp.full((B, 2), 0.7, f32),
-        'haw_prev': jnp.ones((B, 2), f32)}
-    out = dyn.truncate(entries, carry)
+    carry = dyn.initial(B)
+    out = dyn.truncate(make_entries(2), carry)
     assert set(out.keys()) == set(carry.keys())
     assert not np.asarray(out['haw_prev_valid']).any()
-    assert np.allclose(np.asarray(out['haw_prev_obs']), 0.0)
+    assert np.allclose(np.asarray(out['haw_prev_repr']), 0.0)
     assert np.allclose(np.asarray(out['haw_state']), 0.7)
-    assert np.allclose(np.asarray(out['haw_prev']), 1.0)
+    assert np.allclose(np.asarray(out['haw_lam']), 0.3)
     for key in carry:
       assert out[key].shape == carry[key].shape, key
       assert out[key].dtype == carry[key].dtype, key
 
-  def test_starts_drops_observation_only_fields(self):
+  def test_starts_rebuilds_the_representation_from_the_prior(self):
     dyn = make_dyn()
-    carry = dyn.initial(B)
-    entries = {
-        'deter': jnp.ones((B, T, 32), f32),
-        'stoch': jnp.ones((B, T, 4, 4), f32),
-        'haw_state': jnp.zeros((B, T), f32),
-        'haw_prev': jnp.zeros((B, T), f32)}
-    out = dyn.starts(entries, carry, 2)
-    assert set(out.keys()) == {'deter', 'stoch', 'haw_state', 'haw_prev'}
-    assert out['deter'].shape == (B * 2, 32)
-    assert out['haw_state'].shape == (B * 2,)
+    entries = make_entries()
+
+    def fn(entries):
+      carry = dyn.initial(B)
+      out = dyn.starts(entries, carry, 2)
+      want = dyn._event_repr(dyn._prior(nn.cast(out['deter'])))
+      return out, want
+
+    _, (out, want) = init_and_run(fn, entries)
+    assert set(out.keys()) == {
+        'deter', 'stoch', 'haw_state', 'haw_lam',
+        'haw_prev_repr', 'haw_prev_valid'}
+    assert out['deter'].shape == (B * 2, DETER)
+    assert out['haw_lam'].shape == (B * 2,)
+    assert np.asarray(out['haw_prev_valid']).all()
+    assert np.allclose(np.asarray(out['haw_prev_repr']), np.asarray(want))
+
+  def test_haw_lam_survives_entry_to_starts_to_imagine(self):
+    """lam_{t-1} feeds omega, so a change in it must move the first h."""
+    dyn = make_dyn()
+    imgacts = {'action': jnp.zeros((B * 2, 3, ACT), f32)}
+
+    def fn(entries, imgacts):
+      carry = dyn.initial(B)
+      starts = dyn.starts(entries, carry, 2)
+      _, feat, _ = dyn.imagine(starts, imgacts, 3, training=False)
+      return starts['haw_lam'], feat['deter'][:, 0]
+
+    entries = make_entries()
+    bumped = dict(entries, haw_lam=entries['haw_lam'] + 2.0)
+    params = nj.init(fn)({}, entries, imgacts, seed=0)
+    _, (lam_a, det_a) = nj.pure(fn)(params, entries, imgacts, seed=0)
+    _, (lam_b, det_b) = nj.pure(fn)(params, bumped, imgacts, seed=0)
+    assert np.allclose(np.asarray(lam_a), 0.3)
+    assert np.allclose(np.asarray(lam_b), 2.3)
+    assert not np.allclose(np.asarray(det_a), np.asarray(det_b), atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# Causality: x_t must not reach h_t, only h_{t+1}
+# Causality: y_t reaches h_{t+1}, never h_t
 # ---------------------------------------------------------------------------
 
 class TestCausality:
@@ -178,53 +245,37 @@ class TestCausality:
           carry, tokens, acts, reset, training=False, sample_event=False)
 
     params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-    _, (_, _, feat) = nj.pure(fn)(params, tokens, acts, reset, seed=0)
-    return feat
+    return nj.pure(fn)(params, tokens, acts, reset, seed=0)[1][2]
 
   def test_current_observation_does_not_change_current_state(self):
     tokens, _, _ = make_batch()
-    perturbed = tokens.at[:, 2].add(5.0)
     a = self._run(tokens)
-    b = self._run(perturbed)
-    # Everything strictly before the perturbed step is untouched, and at the
-    # perturbed step itself the deterministic state and the Hawkes quantities
-    # must still be identical: x_t only reaches h_{t+1}.
-    for key in ('deter', 'haw_lam', 'haw_prior_prob'):
-      assert np.allclose(
-          np.asarray(a[key])[:, :3], np.asarray(b[key])[:, :3],
-          atol=1e-5), key
+    b = self._run(tokens.at[:, 2].add(5.0))
+    # h_t is built before the posterior is read, so everything up to and
+    # including the perturbed step's deter is untouched.
+    assert np.allclose(
+        np.asarray(a['deter'])[:, :3], np.asarray(b['deter'])[:, :3],
+        atol=1e-5)
 
-  def test_current_observation_can_change_current_probability(self):
+  def test_current_observation_changes_the_current_event_probability(self):
+    """The event model reads the posterior, so x_t must move pi_t."""
     tokens, _, _ = make_batch()
-    perturbed = tokens.at[:, 2].add(5.0)
     a = np.asarray(self._run(tokens)['haw_prob'])[:, 2]
-    b = np.asarray(self._run(perturbed)['haw_prob'])[:, 2]
+    b = np.asarray(self._run(tokens.at[:, 2].add(5.0))['haw_prob'])[:, 2]
     assert not np.allclose(a, b, atol=1e-6), (a, b)
 
-  def test_event_changes_next_deterministic_state(self):
-    """d h_{t+1} / d pi_t must be nonzero through the Hawkes state."""
+  def test_imagination_logits_come_from_the_prior(self):
     dyn = make_dyn()
-    tokens, acts, reset = make_batch(resets=(0,))
+    imgacts = {'action': jnp.zeros((B * 2, 3, ACT), f32)}
 
-    def fn(tokens, acts, reset):
+    def fn(entries, imgacts):
       carry = dyn.initial(B)
-      _, _, feat = dyn.observe(
-          carry, tokens, acts, reset, training=True)
-      return feat
+      starts = dyn.starts(entries, carry, 2)
+      _, feat, _ = dyn.imagine(starts, imgacts, 3, training=False)
+      return feat['logit'], dyn._prior(feat['deter'])
 
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-
-    def gradfn(tokens, acts, reset):
-      def inner(tokens, acts, reset):
-        feat = fn(tokens, acts, reset)
-        return feat['deter'][:, 2:].astype(f32).sum()
-      return nj.grad(inner, [dyn])(tokens, acts, reset)
-
-    _, (_, _, grads) = nj.pure(gradfn)(params, tokens, acts, reset, seed=0)
-    det = [v for k, v in grads.items() if '/det' in k]
-    assert det, sorted(grads)
-    norm = float(jnp.sqrt(sum((v.astype(f32) ** 2).sum() for v in det)))
-    assert norm > 0.0, norm
+    _, (logit, prior) = init_and_run(fn, make_entries(), imgacts)
+    assert np.allclose(np.asarray(logit), np.asarray(prior), atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +283,7 @@ class TestCausality:
 # ---------------------------------------------------------------------------
 
 def _grad_norms(lossfn, keyfilter, resets=(0,), seed=0):
-  """Return the gradient norm over params whose path matches `keyfilter`."""
+  """Gradient norm over params whose path matches `keyfilter`."""
   dyn = make_dyn()
   tokens, acts, reset = make_batch(resets=resets)
 
@@ -256,178 +307,109 @@ def _grad_norms(lossfn, keyfilter, resets=(0,), seed=0):
   return float(jnp.sqrt(sum((v.astype(f32) ** 2).sum() for v in sel)))
 
 
-_is_det = lambda k: '/det' in k
-_is_haw = lambda k: any(
+_is_evt = lambda k: any(
     s in k for s in ('haw_base', 'haw_alpha_raw', 'haw_beta_raw', '/ctx'))
+_is_rssm = lambda k: any(
+    s in k for s in ('/dynin', '/dynhid', '/dyngru', '/obs', '/prior'))
 
 
 class TestGradientRouting:
 
-  def test_haw_loss_has_no_gradient_into_detector(self):
-    n = _grad_norms(lambda los, feat: los['haw'].sum(), _is_det)
+  def test_rate_loss_trains_the_event_model(self):
+    n = _grad_norms(lambda los, feat: los['event_rate'].mean(), _is_evt)
+    assert n > 0.0, n
+
+  def test_rate_loss_does_not_reshape_the_rssm(self):
+    """g_eta's latent inputs are detached, so the budget cannot be met by
+    moving the world model."""
+    n = _grad_norms(lambda los, feat: los['event_rate'].mean(), _is_rssm)
     assert n == 0.0, n
 
-  def test_haw_loss_trains_hawkes_parameters(self):
-    n = _grad_norms(lambda los, feat: los['haw'].sum(), _is_haw)
+  def test_head_event_trains_the_event_model(self):
+    """The observed route the reward and continuation heads use."""
+    n = _grad_norms(lambda los, feat: feat['haw_head_event'].sum(), _is_evt)
     assert n > 0.0, n
 
-  def test_rate_loss_trains_detector(self):
-    n = _grad_norms(lambda los, feat: los['event_rate'].mean(), _is_det)
-    assert n > 0.0, n
-
-  def test_head_event_trains_detector(self):
-    """The route the reward and continuation heads use."""
-    n = _grad_norms(lambda los, feat: feat['haw_head_event'].sum(), _is_det)
-    assert n > 0.0, n
-
-  def test_delayed_world_model_path_trains_detector(self):
-    """y_t -> M_{t+1} -> lambda -> omega -> h_{t+1}, excluding the head route."""
+  def test_delayed_world_model_path_trains_the_event_model(self):
+    """y_t -> M_t -> omega -> h_{t+1}, excluding the head route."""
     n = _grad_norms(
-        lambda los, feat: feat['deter'][:, 2:].astype(f32).sum(), _is_det)
+        lambda los, feat: feat['deter'][:, 2:].astype(f32).sum(), _is_evt)
     assert n > 0.0, n
 
   def test_delayed_path_is_not_vanishing(self):
     """Guard against a dead omega: compare against the direct head route."""
     direct = _grad_norms(
-        lambda los, feat: feat['haw_head_event'].sum(), _is_det)
+        lambda los, feat: feat['haw_head_event'].sum(), _is_evt)
     delayed = _grad_norms(
-        lambda los, feat: feat['deter'][:, 2:].astype(f32).sum(), _is_det)
+        lambda los, feat: feat['deter'][:, 2:].astype(f32).sum(), _is_evt)
     assert delayed > 1e-4 * direct, (delayed, direct)
 
-
-# ---------------------------------------------------------------------------
-# Live vs. detached Hawkes recurrence
-# ---------------------------------------------------------------------------
-
-class TestFittingInvariant:
-
-  @pytest.mark.parametrize('resets', [(0,), (0, 3), (0, 1, 4)])
-  def test_lambda_fit_matches_lambda_model(self, resets):
-    dyn = make_dyn()
-    tokens, acts, reset = make_batch(resets=resets)
-
-    def fn(tokens, acts, reset):
-      carry = dyn.initial(B)
-      return dyn.loss(carry, tokens, acts, reset, training=True)
-
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-    _, (_, _, _, _, mets) = nj.pure(fn)(params, tokens, acts, reset, seed=0)
-    assert float(mets['haw_lam_fit_err']) < 1e-4, float(
-        mets['haw_lam_fit_err'])
-
-  def test_invariant_holds_from_a_nonzero_incoming_carry(self):
-    dyn = make_dyn()
-    tokens, acts, reset = make_batch(resets=())
-
-    def fn(tokens, acts, reset):
-      carry = dyn.initial(B)
-      carry['haw_state'] = jnp.full((B,), 0.4, f32)
-      carry['haw_prev'] = jnp.array([1.0, 0.0, 1.0], f32)
-      carry['haw_prev_valid'] = jnp.ones((B,), bool)
-      carry['deter'] = jnp.full((B, 32), 0.1, nn.COMPUTE_DTYPE)
-      return dyn.loss(carry, tokens, acts, reset, training=True)
-
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-    _, (_, _, _, _, mets) = nj.pure(fn)(params, tokens, acts, reset, seed=0)
-    assert float(mets['haw_lam_fit_err']) < 1e-4, float(
-        mets['haw_lam_fit_err'])
+  def test_delta_is_detached(self):
+    """dr_t is stop-gradded, so nothing flows back into the logit heads
+    through the event model alone."""
+    n = _grad_norms(
+        lambda los, feat: feat['haw_prob'].sum(), lambda k: 'logit' in k)
+    assert n == 0.0, n
 
 
 # ---------------------------------------------------------------------------
-# Hawkes embedding conditioning
-# ---------------------------------------------------------------------------
-
-class TestEmbedding:
-
-  def _omega(self):
-    dyn = make_dyn()
-
-    def fn(state, lam):
-      return dyn._hawkes_embed(state, lam).astype(f32)
-
-    state = jnp.full((B,), 0.2, f32)
-    lam = jnp.full((B,), 0.05, f32)
-    params = nj.init(fn)({}, state, lam, seed=0)
-    return lambda s, l: nj.pure(fn)(params, s, l, seed=0)[1]
-
-  def test_omega_output_moves_with_the_hawkes_state(self):
-    """An RMS norm on the first (2-D) projection would flatten this."""
-    omega = self._omega()
-    lam = jnp.full((B,), 0.05, f32)
-    a = omega(jnp.zeros((B,), f32), lam)
-    b = omega(jnp.full((B,), 0.1, f32), lam)  # one alpha-sized event jump
-    rel = float(jnp.abs(a - b).mean() / (jnp.abs(a).mean() + 1e-8))
-    assert rel > 1e-3, rel
-
-  def test_omega_gradient_is_nonzero(self):
-    omega = self._omega()
-    scalar = lambda s, l: omega(s, l).sum()
-    gs, gl = jax.grad(scalar, argnums=(0, 1))(
-        jnp.full((B,), 0.2, f32), jnp.full((B,), 0.05, f32))
-    assert np.isfinite(np.asarray(gs)).all()
-    assert float(jnp.abs(gs).sum()) > 1e-4, float(jnp.abs(gs).sum())
-    assert float(jnp.abs(gl).sum()) > 1e-8, float(jnp.abs(gl).sum())
-
-
-# ---------------------------------------------------------------------------
-# Imagination / feature-tree compatibility
+# Imagination
 # ---------------------------------------------------------------------------
 
 class TestImagination:
 
-  def test_observed_and_imagined_trees_match(self):
-    dyn = make_dyn()
+  def _observe_then_imagine(self, dyn, length=4, nlast=2):
     tokens, acts, reset = make_batch()
+    imgacts = {'action': jnp.zeros((B * nlast, length, ACT), f32)}
 
-    def fn(tokens, acts, reset):
+    def fn(tokens, acts, reset, imgacts):
       carry = dyn.initial(B)
       carry, entries, feat = dyn.observe(
           carry, tokens, acts, reset, training=True)
-      starts = dyn.starts(entries, carry, 2)
-      imgacts = {'action': jnp.zeros((B * 2, 4, ACT), f32)}
-      _, imgfeat, _ = dyn.imagine(starts, imgacts, 4, training=True)
-      return feat, imgfeat
+      starts = dyn.starts(entries, carry, nlast)
+      imgcarry, imgfeat, _ = dyn.imagine(
+          starts, imgacts, length, training=True)
+      return feat, imgcarry, imgfeat
 
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-    _, (feat, imgfeat) = nj.pure(fn)(params, tokens, acts, reset, seed=0)
+    return init_and_run(fn, tokens, acts, reset, imgacts)[1]
+
+  def test_observed_and_imagined_feature_trees_match(self):
+    feat, _, imgfeat = self._observe_then_imagine(make_dyn())
     assert set(feat.keys()) == set(imgfeat.keys()), (
         set(feat) ^ set(imgfeat))
     for key in feat:
       assert feat[key].dtype == imgfeat[key].dtype, key
       assert feat[key].shape[2:] == imgfeat[key].shape[2:], key
 
+  def test_imagined_carry_has_all_six_fields(self):
+    _, imgcarry, _ = self._observe_then_imagine(make_dyn())
+    assert set(imgcarry.keys()) == {
+        'deter', 'stoch', 'haw_state', 'haw_lam',
+        'haw_prev_repr', 'haw_prev_valid'}, sorted(imgcarry)
+
+  def test_imagined_events_are_binary(self):
+    _, _, imgfeat = self._observe_then_imagine(make_dyn())
+    ev = np.asarray(imgfeat['haw_event'])
+    assert np.isin(ev, (0.0, 1.0)).all(), np.unique(ev)
+    assert np.allclose(np.asarray(imgfeat['haw_valid']), 1.0)
+
   def test_imagination_accepts_a_full_observe_carry(self):
     """report() hands imagine() the observation carry, not starts()."""
     dyn = make_dyn()
     tokens, acts, reset = make_batch()
+    imgacts = {'action': jnp.zeros((B, 3, ACT), f32)}
 
-    def fn(tokens, acts, reset):
+    def fn(tokens, acts, reset, imgacts):
       carry = dyn.initial(B)
       carry, _, _ = dyn.observe(carry, tokens, acts, reset, training=False)
-      imgacts = {'action': jnp.zeros((B, 3, ACT), f32)}
-      _, imgfeat, _ = dyn.imagine(carry, imgacts, 3, training=False)
-      return imgfeat
+      return dyn.imagine(carry, imgacts, 3, training=False)[1]
 
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-    _, imgfeat = nj.pure(fn)(params, tokens, acts, reset, seed=0)
-    assert imgfeat['haw_lam'].shape == (B, 3)
+    _, imgfeat = init_and_run(fn, tokens, acts, reset, imgacts)
+    assert np.isfinite(np.asarray(imgfeat['haw_prob'])).all()
 
   def test_long_imagination_stays_finite(self):
-    dyn = make_dyn(haw_init_alpha=0.5, haw_init_beta=0.1)
-    tokens, acts, reset = make_batch()
-
-    def fn(tokens, acts, reset):
-      carry = dyn.initial(B)
-      carry, entries, _ = dyn.observe(
-          carry, tokens, acts, reset, training=True)
-      starts = dyn.starts(entries, carry, 1)
-      imgacts = {'action': jnp.zeros((B, 64, ACT), f32)}
-      _, imgfeat, _ = dyn.imagine(starts, imgacts, 64, training=True)
-      return imgfeat
-
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-    _, imgfeat = nj.pure(fn)(params, tokens, acts, reset, seed=0)
-    for key in ('haw_lam', 'haw_prior_prob', 'deter'):
+    _, _, imgfeat = self._observe_then_imagine(make_dyn(), length=64, nlast=1)
+    for key in ('deter', 'haw_prob', 'haw_lam', 'haw_delta_mag'):
       assert np.isfinite(np.asarray(imgfeat[key], np.float32)).all(), key
 
 
@@ -435,47 +417,61 @@ class TestImagination:
 # Losses
 # ---------------------------------------------------------------------------
 
+def run_loss(dyn, resets=(0,)):
+  tokens, acts, reset = make_batch(resets=resets)
+
+  def fn(tokens, acts, reset):
+    carry = dyn.initial(B)
+    return dyn.loss(carry, tokens, acts, reset, training=True)
+
+  _, (_, _, losses, feat, mets) = init_and_run(fn, tokens, acts, reset)
+  return losses, feat, mets
+
+
 class TestLosses:
 
   def test_loss_keys_and_shapes(self):
-    dyn = make_dyn()
-    tokens, acts, reset = make_batch()
-
-    def fn(tokens, acts, reset):
-      carry = dyn.initial(B)
-      return dyn.loss(carry, tokens, acts, reset, training=True)
-
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-    _, (_, _, losses, _, mets) = nj.pure(fn)(
-        params, tokens, acts, reset, seed=0)
-    assert set(losses.keys()) == {'dyn', 'rep', 'haw', 'event_rate'}
+    losses, _, mets = run_loss(make_dyn())
+    assert set(losses.keys()) == {'dyn', 'rep', 'event_rate'}, sorted(losses)
     for key, value in losses.items():
       assert value.shape == (B, T), (key, value.shape)
-      assert np.isfinite(np.asarray(value, np.float32)).all(), key
     assert np.isfinite(
         np.asarray([float(v) for v in mets.values()], np.float32)).all()
 
-  def test_losses_are_zero_on_invalid_transitions(self):
-    dyn = make_dyn()
-    tokens, acts, reset = make_batch(resets=(0, 3))
+  def test_no_hawkes_kl_is_returned(self):
+    losses, _, _ = run_loss(make_dyn())
+    assert 'haw' not in losses
 
-    def fn(tokens, acts, reset):
-      carry = dyn.initial(B)
-      return dyn.loss(carry, tokens, acts, reset, training=True)
+  def test_replay_boundary_steps_still_count_in_the_rate(self):
+    """haw_prev_valid must gate the delta only, never the loss mask."""
+    _, feat, mets = run_loss(make_dyn(), resets=())
+    assert np.allclose(np.asarray(feat['haw_valid']), 1.0)
+    assert float(mets['haw_valid_frac']) == 1.0
 
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
-    _, (_, _, losses, feat, _) = nj.pure(fn)(
-        params, tokens, acts, reset, seed=0)
-    invalid = np.asarray(feat['haw_valid']) == 0
-    assert np.allclose(np.asarray(losses['haw'])[invalid], 0.0)
+  def test_reset_steps_are_excluded_from_the_rate(self):
+    _, feat, mets = run_loss(make_dyn(), resets=(0, 3))
+    valid = np.asarray(feat['haw_valid'])
+    prob = np.asarray(feat['haw_prob'])
+    want = (valid * prob).sum() / max(valid.sum(), 1.0)
+    assert np.allclose(float(mets['event_rate_obs']), want, atol=1e-6)
+    assert np.isclose(float(mets['haw_valid_frac']), valid.mean())
 
   def test_rate_loss_is_two_sided(self):
-    """A collapsed detector must be pushed up, not further down."""
+    """A collapsed event model must be pushed up, not further down."""
     rho, clip = 0.1, 1e-3
     kl = lambda r: (
         rho * (np.log(rho) - np.log(r)) +
         (1 - rho) * (np.log1p(-rho) - np.log1p(-r)))
     assert kl(0.02) > 0 and kl(0.30) > 0
     assert abs(kl(rho)) < 1e-9
-    # Finite and not explosive at the clip floor.
     assert np.isfinite(kl(clip)) and kl(clip) < 1e3
+
+  def test_initial_rate_sits_at_the_target(self):
+    """b is initialized so 1 - exp(-softplus(b)) == rho and g_eta starts at
+    zero output, so the first step (M = 0) lands exactly on rho. Later steps
+    only rise, since the excitation is positive."""
+    _, feat, mets = run_loss(make_dyn(haw_target_rate=0.1), resets=())
+    assert np.allclose(np.asarray(feat['haw_ctx']), 0.0, atol=1e-6)
+    prob = np.asarray(feat['haw_prob'])
+    assert np.allclose(prob[:, 0], 0.1, atol=1e-4), prob[:, 0]
+    assert float(mets['event_rate_obs']) >= 0.1 - 1e-6

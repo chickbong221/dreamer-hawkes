@@ -22,6 +22,12 @@ concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
 isimage = lambda s: s.dtype in (np.uint8, np.uint16) and len(s.shape) == 3
 
 
+def _bern_ent(p):
+  """Mean Bernoulli entropy in nats; low means the events are sharp."""
+  p = jnp.clip(f32(p), 1e-6, 1.0 - 1e-6)
+  return -(p * jnp.log(p) + (1.0 - p) * jnp.log1p(-p)).mean()
+
+
 class Agent(embodied.jax.Agent):
 
   banner = [
@@ -46,13 +52,8 @@ class Agent(embodied.jax.Agent):
         'rssm': rssm.RSSM,
         'hawkes': hawkes_rssm.HawkesRSSM,
     }[config.dyn.typ]
-    if config.dyn.typ == 'hawkes':
-      self.dyn = dyn_cls(
-          act_space, obs_dim=self.enc.output_size,
-          **config.dyn[config.dyn.typ], name='dyn')
-    else:
-      self.dyn = dyn_cls(
-          act_space, **config.dyn[config.dyn.typ], name='dyn')
+    self.dyn = dyn_cls(
+        act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
         'simple': rssm.Decoder,
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
@@ -91,7 +92,6 @@ class Agent(embodied.jax.Agent):
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
     if not self.hawkes:
-      scales = {k: v for k, v in scales.items() if not k.startswith('haw')}
       scales.pop('event_rate', None)
     self.scales = scales
 
@@ -150,7 +150,7 @@ class Agent(embodied.jax.Agent):
     # and the train assertion `data.keys() == self.spaces.keys()` rejects
     # any extra fields. eval-mode outs are consumed locally and discarded.
     if self.hawkes and mode == 'eval':
-      for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
+      for key in ('haw_prob', 'haw_event'):
         out[key] = feat[key]
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
@@ -222,6 +222,15 @@ class Agent(embodied.jax.Agent):
     starts = self.dyn.starts(dyn_entries, dyn_carry, K)
     policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
     _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
+    if self.hawkes:
+      # Imagined counterparts of the observed event metrics. The observed/
+      # imagined rate gap is the diagnostic for the prior-to-prior delta being
+      # smaller than the posterior-to-posterior one.
+      metrics.update({
+          'event_rate_img': f32(imgfeat['haw_prob']).mean(),
+          'event_hard_rate_img': f32(imgfeat['haw_event']).mean(),
+          'event_prob_entropy_img': _bern_ent(imgfeat['haw_prob']),
+          'event_delta_mag_img': f32(imgfeat['haw_delta_mag']).mean()})
     first = jax.tree.map(
         lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
     imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)

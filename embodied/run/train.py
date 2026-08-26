@@ -313,7 +313,7 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
 
         if event_data is not None and eval_episode_idx == 0 and \
            'haw_prob' in outs:
-          for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
+          for key in ('haw_prob', 'haw_event'):
             event_data[key].append(float(_to_numpy(outs[key])[0]))
           for key in ('image', 'depth_head', 'depth_hand'):
             if key in obs:

@@ -4,13 +4,13 @@ Builds W&B panels from the first episode of evaluation environment index 0.
 The evaluation loop supplies already-collected Hawkes features and observation
 frames, so this module never creates an environment or runs an extra rollout.
 
-Scope is deliberately narrow. Aggregate Hawkes statistics (rate, prior gap,
-intensity, learned b/alpha/beta) are already logged as training metrics by
+Scope is deliberately narrow. Aggregate Hawkes statistics (observed and
+imagined rates, intensity, learned b/alpha/beta) are already logged by
 `HawkesRSSM.loss()` every `log_every` steps, where they trend properly. What
 those cannot show is *where inside one episode* events fire, so that is all
 this module produces:
 
-  event/probs           pi_t and p_haw_t over the episode
+  event/probs           pi_t over the episode
   event/spike_trace     binary strip of hard events
   event/episode_video   frames with a red border on spike steps
   event/hard_count      events in the episode
@@ -73,7 +73,7 @@ def build_event_episode_payload(agent, data, max_depth=None):
   Args:
     agent: Dreamer agent with Hawkes dynamics.
     data: arrays captured from evaluation environment index 0. Required keys
-      are haw_prob, haw_event and haw_prior_prob. Depth frames are optional.
+      are haw_prob and haw_event. Depth frames are optional.
     max_depth: depth maximum in millimeters for uint16 visualization.
 
   Returns:
@@ -101,7 +101,6 @@ def build_event_episode_payload(agent, data, max_depth=None):
   prob = np.asarray(data['haw_prob'], np.float32).reshape(-1)
   T = len(prob)
   event = np.asarray(data['haw_event'], np.float32).reshape(-1)[:T]
-  prior = np.asarray(data['haw_prior_prob'], np.float32).reshape(-1)[:T]
   spikes = event > 0.5
 
   payload = {
@@ -109,13 +108,12 @@ def build_event_episode_payload(agent, data, max_depth=None):
       'event/expected_count': float(prob.sum()),
   }
 
-  # Posterior against causal prior, one chart. lambda_t is omitted on purpose:
-  # p_haw = 1 - exp(-lambda) is a monotone transform of it, so plotting both
-  # shows the same curve twice.
+  # One curve: there is a single event model now. lambda_t is omitted on
+  # purpose, since pi = 1 - exp(-lambda) is a monotone transform of it.
   payload['event/probs'] = wandb.plot.line_series(
       xs=list(range(T)),
-      ys=[prob.tolist(), prior.tolist()],
-      keys=['post_prob', 'prior_prob'],
+      ys=[prob.tolist()],
+      keys=['event_prob'],
       title='Event probability over the episode', xname='t')
 
   # Binary strip: red where an event fired, dark otherwise.
