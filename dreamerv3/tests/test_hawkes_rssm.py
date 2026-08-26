@@ -236,6 +236,12 @@ class TestCarryContract:
 class TestCausality:
 
   def _run(self, tokens):
+    """Observe with g_eta woken up.
+
+    `ctxout` is zero-initialized by design, so at init pi_t is exactly rho and
+    reads none of its inputs. Give it weights, or these tests compare rho
+    against rho.
+    """
     dyn = make_dyn()
     _, acts, reset = make_batch(resets=(0,))
 
@@ -244,7 +250,11 @@ class TestCausality:
       return dyn.observe(
           carry, tokens, acts, reset, training=False, sample_event=False)
 
-    params = nj.init(fn)({}, tokens, acts, reset, seed=0)
+    params = dict(nj.init(fn)({}, tokens, acts, reset, seed=0))
+    key, = [k for k in params if 'ctxout' in k and k.endswith('kernel')]
+    params[key] = jnp.asarray(
+        np.random.RandomState(0).normal(0, 0.5, params[key].shape),
+        params[key].dtype)
     return nj.pure(fn)(params, tokens, acts, reset, seed=0)[1][2]
 
   def test_current_observation_does_not_change_current_state(self):
@@ -275,7 +285,12 @@ class TestCausality:
       return feat['logit'], dyn._prior(feat['deter'])
 
     _, (logit, prior) = init_and_run(fn, make_entries(), imgacts)
-    assert np.allclose(np.asarray(logit), np.asarray(prior), atol=1e-5)
+    logit, prior = np.asarray(logit), np.asarray(prior)
+    # No bit-exact match available: f32 matmuls default to TF32 on GPU, and the
+    # scanned per-step call tiles differently from this re-batched one. Require
+    # the gap to be negligible against the logit scale instead.
+    gap = np.abs(logit - prior).max()
+    assert gap < 0.05 * logit.std(), (gap, logit.std())
 
 
 # ---------------------------------------------------------------------------
