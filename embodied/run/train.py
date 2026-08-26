@@ -315,6 +315,10 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
            'haw_prob' in outs:
           for key in ('haw_prob', 'haw_event'):
             event_data[key].append(float(_to_numpy(outs[key])[0]))
+          # Vector-valued: the typed event is [K], not a scalar.
+          if 'haw_type' in outs:
+            event_data['haw_type'].append(
+                _to_numpy(outs['haw_type'])[0].copy())
           for key in ('image', 'depth_head', 'depth_hand'):
             if key in obs:
               event_data[key].append(_to_numpy(obs[key][0]).copy())

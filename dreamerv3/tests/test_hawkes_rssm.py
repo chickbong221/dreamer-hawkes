@@ -21,6 +21,7 @@ from dreamerv3.hawkes_rssm import HawkesRSSM  # noqa: E402
 
 B, T, OBS, ACT = 3, 6, 12, 4
 DETER, STOCH, CLASSES, UNIMIX = 32, 4, 4, 0.01
+TYPES = 4
 f32 = jnp.float32
 
 
@@ -28,7 +29,7 @@ def make_dyn(**kw):
   base = dict(
       deter=DETER, hidden=16, stoch=STOCH, classes=CLASSES, blocks=4,
       act='silu', norm='rms', unimix=UNIMIX, haw_hidden=16, haw_embed=8,
-      haw_context_hidden=8, haw_target_rate=0.1)
+      haw_context_hidden=8, haw_target_rate=0.1, haw_types=TYPES)
   base.update(kw)
   act_space = {'action': elements.Space(np.float32, (ACT,), -1, 1)}
   return HawkesRSSM(act_space, **base, name='dyn')
@@ -167,14 +168,16 @@ def make_entries(steps=T):
       'deter': jnp.ones((B, steps, DETER), f32),
       'stoch': jnp.ones((B, steps, STOCH, CLASSES), f32),
       'haw_state': jnp.full((B, steps), 0.7, f32),
-      'haw_lam': jnp.full((B, steps), 0.3, f32)}
+      'haw_lam': jnp.full((B, steps), 0.3, f32),
+      'haw_type': jnp.zeros((B, steps, TYPES), f32).at[..., 1].set(1.0)}
 
 
 class TestCarryContract:
 
   def test_entry_space_excludes_the_previous_representation(self):
     keys = set(make_dyn().entry_space.keys())
-    assert keys == {'deter', 'stoch', 'haw_state', 'haw_lam'}, keys
+    assert keys == {
+        'deter', 'stoch', 'haw_state', 'haw_lam', 'haw_type'}, keys
 
   def test_truncate_zeroes_the_delta_and_keeps_the_hawkes_state(self):
     dyn = make_dyn()
@@ -185,6 +188,7 @@ class TestCarryContract:
     assert np.allclose(np.asarray(out['haw_prev_repr']), 0.0)
     assert np.allclose(np.asarray(out['haw_state']), 0.7)
     assert np.allclose(np.asarray(out['haw_lam']), 0.3)
+    assert np.allclose(np.asarray(out['haw_type'])[:, 1], 1.0)
     for key in carry:
       assert out[key].shape == carry[key].shape, key
       assert out[key].dtype == carry[key].dtype, key
@@ -201,7 +205,7 @@ class TestCarryContract:
 
     _, (out, want) = init_and_run(fn, entries)
     assert set(out.keys()) == {
-        'deter', 'stoch', 'haw_state', 'haw_lam',
+        'deter', 'stoch', 'haw_state', 'haw_lam', 'haw_type',
         'haw_prev_repr', 'haw_prev_valid'}
     assert out['deter'].shape == (B * 2, DETER)
     assert out['haw_lam'].shape == (B * 2,)
@@ -326,6 +330,8 @@ _is_evt = lambda k: any(
     s in k for s in ('haw_base', 'haw_alpha_raw', 'haw_beta_raw', '/ctx'))
 _is_rssm = lambda k: any(
     s in k for s in ('/dynin', '/dynhid', '/dyngru', '/obs', '/prior'))
+_is_type = lambda k: '/typeout' in k
+_is_trunk = lambda k: '/ctx' in k or 'haw_' in k
 
 
 class TestGradientRouting:
@@ -340,9 +346,9 @@ class TestGradientRouting:
     n = _grad_norms(lambda los, feat: los['event_rate'].mean(), _is_rssm)
     assert n == 0.0, n
 
-  def test_head_event_trains_the_event_model(self):
+  def test_typed_event_trains_the_event_model(self):
     """The observed route the reward and continuation heads use."""
-    n = _grad_norms(lambda los, feat: feat['haw_head_event'].sum(), _is_evt)
+    n = _grad_norms(lambda los, feat: feat['haw_type'].sum(), _is_evt)
     assert n > 0.0, n
 
   def test_delayed_world_model_path_trains_the_event_model(self):
@@ -354,10 +360,27 @@ class TestGradientRouting:
   def test_delayed_path_is_not_vanishing(self):
     """Guard against a dead omega: compare against the direct head route."""
     direct = _grad_norms(
-        lambda los, feat: feat['haw_head_event'].sum(), _is_evt)
+        lambda los, feat: feat['haw_type'].sum(), _is_evt)
     delayed = _grad_norms(
         lambda los, feat: feat['deter'][:, 2:].astype(f32).sum(), _is_evt)
     assert delayed > 1e-4 * direct, (delayed, direct)
+
+  def test_cluster_losses_train_the_type_readout(self):
+    for key in ('event_conf', 'event_use'):
+      n = _grad_norms(lambda los, feat: los[key].mean(), _is_type)
+      assert n > 0.0, (key, n)
+
+  def test_cluster_losses_do_not_touch_the_shared_trunk(self):
+    """Both u_t and the event weights are detached in these losses, so they
+    cannot reshape the detector to manufacture easy clusters."""
+    for key in ('event_conf', 'event_use'):
+      assert _grad_norms(lambda los, feat: los[key].mean(), _is_trunk) == 0.0, key
+      assert _grad_norms(lambda los, feat: los[key].mean(), _is_rssm) == 0.0, key
+
+  def test_typed_event_trains_the_type_readout(self):
+    """Downstream utility, unlike the cluster losses, does reach typeout."""
+    n = _grad_norms(lambda los, feat: feat['haw_type'].sum(), _is_type)
+    assert n > 0.0, n
 
   def test_delta_is_detached(self):
     """dr_t is stop-gradded, so nothing flows back into the logit heads
@@ -396,10 +419,10 @@ class TestImagination:
       assert feat[key].dtype == imgfeat[key].dtype, key
       assert feat[key].shape[2:] == imgfeat[key].shape[2:], key
 
-  def test_imagined_carry_has_all_six_fields(self):
+  def test_imagined_carry_has_every_field(self):
     _, imgcarry, _ = self._observe_then_imagine(make_dyn())
     assert set(imgcarry.keys()) == {
-        'deter', 'stoch', 'haw_state', 'haw_lam',
+        'deter', 'stoch', 'haw_state', 'haw_lam', 'haw_type',
         'haw_prev_repr', 'haw_prev_valid'}, sorted(imgcarry)
 
   def test_imagined_events_are_binary(self):
@@ -447,7 +470,8 @@ class TestLosses:
 
   def test_loss_keys_and_shapes(self):
     losses, _, mets = run_loss(make_dyn())
-    assert set(losses.keys()) == {'dyn', 'rep', 'event_rate'}, sorted(losses)
+    assert set(losses.keys()) == {
+        'dyn', 'rep', 'event_rate', 'event_conf', 'event_use'}, sorted(losses)
     for key, value in losses.items():
       assert value.shape == (B, T), (key, value.shape)
     assert np.isfinite(
@@ -490,3 +514,142 @@ class TestLosses:
     prob = np.asarray(feat['haw_prob'])
     assert np.allclose(prob[:, 0], 0.1, atol=1e-4), prob[:, 0]
     assert float(mets['event_rate_obs']) >= 0.1 - 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Event types
+# ---------------------------------------------------------------------------
+
+def onehot(k, batch=B):
+  return jnp.zeros((batch, TYPES), f32).at[:, k].set(1.0)
+
+
+class TestOmega:
+  """omega must stay sensitive to M and lam once the type channels join it."""
+
+  def _omega(self):
+    dyn = make_dyn()
+
+    def fn(state, lam, typ):
+      return dyn._hawkes_embed(state, lam, typ).astype(f32)
+
+    args = (jnp.full((B,), 0.2, f32), jnp.full((B,), 0.05, f32), onehot(1))
+    params = nj.init(fn)({}, *args, seed=0)
+    return lambda *a: nj.pure(fn)(params, *a, seed=0)[1]
+
+  def _rel(self, a, b):
+    return float(jnp.abs(a - b).mean() / (jnp.abs(a).mean() + 1e-8))
+
+  def test_output_moves_with_the_hawkes_state(self):
+    """Held at a fixed nonzero type, so this is the type-domination guard:
+    the one-hot arrives at 1.0 while M sits two orders of magnitude below it,
+    and haw_type_input_scale is what keeps M readable."""
+    omega, lam, typ = self._omega(), jnp.full((B,), 0.05, f32), onehot(1)
+    a = omega(jnp.zeros((B,), f32), lam, typ)
+    b = omega(jnp.full((B,), 0.1, f32), lam, typ)  # one alpha-sized jump
+    assert self._rel(a, b) > 1e-3, self._rel(a, b)
+
+  def test_output_moves_with_the_intensity(self):
+    omega, state, typ = self._omega(), jnp.full((B,), 0.2, f32), onehot(1)
+    a = omega(state, jnp.zeros((B,), f32), typ)
+    b = omega(state, jnp.full((B,), 0.05, f32), typ)
+    assert self._rel(a, b) > 1e-4, self._rel(a, b)
+
+  def test_output_moves_with_the_type(self):
+    omega = self._omega()
+    state, lam = jnp.full((B,), 0.2, f32), jnp.full((B,), 0.05, f32)
+    a = omega(state, lam, onehot(0))
+    b = omega(state, lam, onehot(2))
+    assert self._rel(a, b) > 1e-3, self._rel(a, b)
+
+  def test_gradient_is_nonzero_for_every_input(self):
+    omega = self._omega()
+    scalar = lambda s, l, c: omega(s, l, c).sum()
+    grads = jax.grad(scalar, argnums=(0, 1, 2))(
+        jnp.full((B,), 0.2, f32), jnp.full((B,), 0.05, f32), onehot(1))
+    for name, g in zip(('state', 'lam', 'type'), grads):
+      assert np.isfinite(np.asarray(g)).all(), name
+      assert float(jnp.abs(g).sum()) > 1e-8, (name, float(jnp.abs(g).sum()))
+
+
+class TestTypedEvent:
+
+  def test_typed_event_is_zero_or_one_hot(self):
+    _, _, feat = observe(make_dyn(), *make_batch(), training=False,
+                         sample_event=True)
+    typed = np.asarray(feat['haw_type'])
+    event = np.asarray(feat['haw_event'])
+    assert np.isin(typed, (0.0, 1.0)).all(), np.unique(typed)
+    # Exactly one type active iff an event fired, and y is its sum.
+    assert np.allclose(typed.sum(-1), event)
+
+  def test_head_mix_is_a_distribution_and_one_hot_when_observing(self):
+    _, _, feat = observe(make_dyn(), *make_batch(), training=False,
+                         sample_event=True)
+    w = np.asarray(feat['haw_head_mix'])
+    assert w.shape == (B, T, TYPES + 1)
+    assert np.allclose(w.sum(-1), 1.0, atol=1e-5)
+    assert np.isin(w, (0.0, 1.0)).all(), np.unique(w)
+
+  def test_head_mix_is_the_joint_when_imagining(self):
+    dyn = make_dyn()
+    imgacts = {'action': jnp.zeros((B * 2, 3, ACT), f32)}
+
+    def fn(entries, imgacts):
+      carry = dyn.initial(B)
+      starts = dyn.starts(entries, carry, 2)
+      _, feat, _ = dyn.imagine(starts, imgacts, 3, training=True)
+      return feat
+
+    _, feat = init_and_run(fn, make_entries(), imgacts)
+    w = np.asarray(feat['haw_head_mix'])
+    prob = np.asarray(feat['haw_prob'])
+    a = np.asarray(feat['haw_type_prob'])
+    assert np.allclose(w.sum(-1), 1.0, atol=1e-5)
+    assert np.allclose(w[..., 0], 1.0 - prob, atol=1e-5)
+    assert np.allclose(w[..., 1:], prob[..., None] * a, atol=1e-5)
+
+  def test_type_probabilities_are_a_distribution(self):
+    _, _, feat = observe(make_dyn(), *make_batch())
+    for key in ('haw_type_prob', 'haw_type_prob_sg'):
+      a = np.asarray(feat[key])
+      assert a.shape == (B, T, TYPES), (key, a.shape)
+      assert np.allclose(a.sum(-1), 1.0, atol=1e-5), key
+      assert (a > 0).all(), key
+
+  def test_type_head_is_not_zero_initialized(self):
+    """At exactly uniform logits the assignment entropy sits at a
+    zero-gradient saddle, so `typeout` must start with real weights."""
+    _, _, feat = observe(make_dyn(), *make_batch())
+    a = np.asarray(feat['haw_type_prob'])
+    assert a.std() > 1e-6, a.std()
+
+  def test_reset_masks_the_typed_event(self):
+    _, _, feat = observe(make_dyn(), *make_batch(resets=(0, 3)))
+    typed = np.asarray(feat['haw_type'])
+    assert np.allclose(typed[:, [0, 3]], 0.0)
+
+  def test_previous_type_cannot_cross_an_episode_reset(self):
+    dyn = make_dyn()
+    tokens, acts, _ = make_batch()
+
+    def fn(typ, tokens, acts, reset):
+      carry = dict(dyn.initial(B))
+      carry['haw_type'] = typ
+      carry['haw_state'] = jnp.full((B,), 0.5, f32)
+      carry['haw_lam'] = jnp.full((B,), 0.5, f32)
+      return dyn.observe(
+          carry, tokens, acts, reset, training=False, sample_event=False)
+
+    _, _, blocked = make_batch(resets=(0,))
+    _, _, open_ = make_batch(resets=())
+    params = nj.init(fn)({}, onehot(0), tokens, acts, blocked, seed=0)
+    step0 = lambda typ, reset: np.asarray(
+        nj.pure(fn)(params, typ, tokens, acts, reset, seed=0)[1][2]
+        ['deter'])[:, 0]
+    # With a reset the incoming type is masked out of omega ...
+    assert np.allclose(
+        step0(onehot(0), blocked), step0(onehot(2), blocked), atol=1e-6)
+    # ... and without one it demonstrably reaches h_t, so the test has teeth.
+    assert not np.allclose(
+        step0(onehot(0), open_), step0(onehot(2), open_), atol=1e-6)

@@ -11,7 +11,7 @@ those cannot show is *where inside one episode* events fire, so that is all
 this module produces:
 
   event/probs           pi_t over the episode
-  event/spike_trace     binary strip of hard events
+  event/spike_trace     binary strip of hard events, colored by type
   event/episode_video   frames with a red border on spike steps
   event/hard_count      events in the episode
   event/expected_count  sum of pi_t (still meaningful when the eval
@@ -19,6 +19,12 @@ this module produces:
 """
 
 import numpy as np
+
+# Distinguishable on both light and dark W&B themes; cycled if K is larger.
+_TYPE_COLORS = np.array([
+    [255, 60, 60], [70, 170, 255], [90, 220, 120], [250, 190, 60],
+    [200, 110, 255], [255, 140, 60], [60, 220, 220], [230, 230, 120],
+], np.uint8)
 
 
 def _upscale(image, target_h, target_w):
@@ -73,7 +79,8 @@ def build_event_episode_payload(agent, data, max_depth=None):
   Args:
     agent: Dreamer agent with Hawkes dynamics.
     data: arrays captured from evaluation environment index 0. Required keys
-      are haw_prob and haw_event. Depth frames are optional.
+      are haw_prob and haw_event; haw_type colors the strip when present.
+      Depth frames are optional.
     max_depth: depth maximum in millimeters for uint16 visualization.
 
   Returns:
@@ -116,13 +123,19 @@ def build_event_episode_payload(agent, data, max_depth=None):
       keys=['event_prob'],
       title='Event probability over the episode', xname='t')
 
-  # Binary strip: red where an event fired, dark otherwise.
+  # Binary strip, colored by assigned type where one is available. Cluster ids
+  # are arbitrary and permute across runs, so read the grouping, not the hue.
   strip = np.zeros((1, T, 3), np.uint8)
-  strip[0, spikes] = np.array([255, 60, 60], np.uint8)
-  strip[0, ~spikes] = np.array([30, 30, 40], np.uint8)
+  strip[0] = np.array([30, 30, 40], np.uint8)
+  types = data.get('haw_type')
+  if types is not None and len(types):
+    kind = np.asarray(types, np.float32)[:T].argmax(-1)
+    strip[0, spikes] = _TYPE_COLORS[kind[spikes] % len(_TYPE_COLORS)]
+  else:
+    strip[0, spikes] = np.array([255, 60, 60], np.uint8)
   payload['event/spike_trace'] = wandb.Image(
       _upscale(strip, 24, T * 6),
-      caption=f'{int(spikes.sum())} events in {T} steps')
+      caption=f'{int(spikes.sum())} events in {T} steps, colored by type')
 
   # Episode video with an event bar above the frame: dark grey normally, red
   # on the steps where an event fired.

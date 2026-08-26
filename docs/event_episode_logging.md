@@ -18,9 +18,12 @@ across the whole run:
 `event_rate_obs`, `event_rate_error`, `event_hard_rate_obs`,
 `event_prob_entropy_obs`, `event_prob_std_time_obs`, `event_delta_mag_obs`,
 `event_rate_img`, `event_hard_rate_img`, `event_prob_entropy_img`,
-`event_delta_mag_img`, `haw_lam_mean`, `haw_lam_max`, `haw_state_mean`,
-`haw_state_max`, `haw_ctx_std`, `haw_base`, `haw_alpha`, `haw_beta`,
-`haw_valid_frac`.
+`event_delta_mag_img`, `event_type_entropy_sample`,
+`event_type_entropy_usage`, `event_type_effective_count`,
+`event_type_max_occupancy`, `event_type_min_occupancy`,
+`event_type_usage_obs/<k>`, `event_type_usage_img/<k>`, `haw_lam_mean`,
+`haw_lam_max`, `haw_state_mean`, `haw_state_max`, `haw_ctx_std`,
+`haw_base`, `haw_alpha`, `haw_beta`, `haw_valid_frac`.
 
 **Eval event panels** (this module) show only what an aggregate cannot: *where
 inside a single episode* events fire. Anything that would merely restate a
@@ -31,7 +34,7 @@ training metric is deliberately not logged here.
 | W&B key | Type | Content |
 |---|---|---|
 | `event/probs` | Line | `pi_t` over the episode |
-| `event/spike_trace` | Image | `[1 x T]` strip, red where an event fired |
+| `event/spike_trace` | Image | `[1 x T]` strip, colored by assigned type where an event fired |
 | `event/episode_video` | Video | mp4 of the episode with a bar above the frame, red on spike steps |
 | `event/hard_count` | Scalar | events in the episode |
 | `event/expected_count` | Scalar | `sum(pi_t)` |
@@ -48,13 +51,13 @@ other four panels still appear.
 
 ## Capture path
 
-`Agent.policy()` surfaces `haw_prob` and `haw_event` in `outs`, but only when `mode == 'eval'`. That gating matters: under
+`Agent.policy()` surfaces `haw_prob`, `haw_event` and `haw_type` in `outs`, but only when `mode == 'eval'`. That gating matters: under
 `mode='train'` the driver merges `outs` into the transitions written to
 replay, and `agent.train()` asserts the per-batch keys equal `self.spaces`
 exactly, so extra fields there would break training. `mode` is a
 `static_argnums` argument, so the branch is compiled away.
 
-`embodied/run/train.py` pairs those two scalars with the `image` /
+`embodied/run/train.py` pairs those with the `image` /
 `depth_head` / `depth_hand` frames from the same steps.
 
 Policy outputs are already host-side (`fetch_async`). Anything read from
@@ -102,6 +105,14 @@ Other things worth watching:
   latent-delta channel, not changing the Hawkes recurrence.
 - **`haw_alpha` decaying to zero** means the Hawkes memory is not being used
   and `g_eta` is carrying the whole prediction.
+- **`event_type_effective_count` near 1** is single-cluster collapse. Near
+  `K` with no visible difference between the strips of each type is the
+  opposite failure: `event_use` splitting identical events to fill the
+  budget. Lower `loss_scales.event_use` in that case.
+- **A type frequent in `event_type_usage_obs/<k>` and absent from
+  `event_type_usage_img/<k>`** is the posterior/prior mismatch showing up
+  per type. Cluster ids permute across runs, so compare distributions
+  rather than individual indices.
 
 ## Dependencies
 
