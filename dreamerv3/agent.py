@@ -52,8 +52,13 @@ class Agent(embodied.jax.Agent):
         'rssm': rssm.RSSM,
         'hawkes': hawkes_rssm.HawkesRSSM,
     }[config.dyn.typ]
-    self.dyn = dyn_cls(
-        act_space, **config.dyn[config.dyn.typ], name='dyn')
+    if config.dyn.typ == 'hawkes':
+      self.dyn = dyn_cls(
+          act_space, obs_dim=self.enc.output_size,
+          **config.dyn[config.dyn.typ], name='dyn')
+    else:
+      self.dyn = dyn_cls(
+          act_space, **config.dyn[config.dyn.typ], name='dyn')
     self.dec = {
         'simple': rssm.Decoder,
     }[config.dec.typ](dec_space, **config.dec[config.dec.typ], name='dec')
@@ -92,7 +97,7 @@ class Agent(embodied.jax.Agent):
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
     if not self.hawkes:
-      for key in ('event_rate', 'event_conf', 'event_use'):
+      for key in ('haw', 'event_rate'):
         scales.pop(key, None)
     self.scales = scales
 
@@ -151,7 +156,7 @@ class Agent(embodied.jax.Agent):
     # and the train assertion `data.keys() == self.spaces.keys()` rejects
     # any extra fields. eval-mode outs are consumed locally and discarded.
     if self.hawkes and mode == 'eval':
-      for key in ('haw_prob', 'haw_event', 'haw_type'):
+      for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
         out[key] = feat[key]
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
@@ -224,20 +229,15 @@ class Agent(embodied.jax.Agent):
     policyfn = lambda feat: sample(self.pol(self.feat2tensor(feat), 1))
     _, imgfeat, imgprevact = self.dyn.imagine(starts, policyfn, H, training)
     if self.hawkes:
-      # Imagined counterparts of the observed event metrics. The observed/
-      # imagined rate gap is the diagnostic for the prior-to-prior delta being
-      # smaller than the posterior-to-posterior one; a type used often when
-      # observing and never when imagining is the same mismatch, per type.
-      w = f32(imgfeat['haw_prob'])
-      abar = (w[..., None] * f32(imgfeat['haw_type_prob'])).sum((0, 1))
-      abar = abar / (w.sum() + 1e-8)
+      # Imagined counterparts of the observed metrics. The observed/imagined
+      # rate gap is the deployment diagnostic: observed events come from the
+      # detector, imagined ones from the Hawkes prior.
       metrics.update({
-          'event_rate_img': w.mean(),
+          'event_rate_img': f32(imgfeat['haw_prob']).mean(),
           'event_hard_rate_img': f32(imgfeat['haw_event']).mean(),
           'event_prob_entropy_img': _bern_ent(imgfeat['haw_prob']),
+          'event_prob_std_time_img': f32(imgfeat['haw_prob']).std(1).mean(),
           'event_delta_mag_img': f32(imgfeat['haw_delta_mag']).mean()})
-      metrics.update({
-          f'event_type_usage_img/{k}': abar[k] for k in range(abar.shape[-1])})
     first = jax.tree.map(
         lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
     imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
@@ -292,39 +292,29 @@ class Agent(embodied.jax.Agent):
     return loss, (carry, entries, outs, metrics)
 
   def _headfeat(self, feat):
-    """Base feature, plus the typed event for the reward/cont heads.
-
-    `y_t c_t` only: appending y_t as well would be exactly redundant, since
-    y_t is the sum of the typed vector.
-    """
+    """Base feature, plus the binary event for the reward/cont heads."""
     x = self.feat2tensor(feat)
     if not self.hawkes:
       return x
-    return jnp.concatenate([x, nn.cast(feat['haw_type'])], -1)
+    return jnp.concatenate(
+        [x, nn.cast(feat['haw_head_event'])[..., None]], -1)
 
   def _headmix(self, head, feat, readout):
-    """E[readout(head)] over the K + 1 event outcomes.
+    """E_y[readout(head)] over the binary event.
 
-    Evaluates the head only at no-event and at each one-hot type, so it never
-    leaves the support it was trained on. `haw_head_mix` is one-hot on the
-    realized outcome for observed steps and the joint (1 - pi, pi a_k) for
-    imagined ones, so this is exact in both cases without the return noise of
-    a hard sample.
-
-    Unrolled rather than folded into one batched call: the (K + 1) copies of
-    `base` would be the largest activation in the imagination path.
+    Evaluates the head only at y in {0, 1}, so it never leaves the support it
+    was trained on. Exact for observed steps (weight is already 0 or 1) and
+    the exact expectation for imagined steps (weight is the Hawkes p_t),
+    without the return noise of a hard sample.
     """
     if not self.hawkes:
       return readout(head(self.feat2tensor(feat), 2))
     base = self.feat2tensor(feat)
-    w = f32(feat['haw_head_mix'])
-    K = w.shape[-1] - 1
-    zeros = jnp.zeros((*base.shape[:-1], K), base.dtype)
-    outs = []
-    for k in range(K + 1):
-      chan = zeros if k == 0 else zeros.at[..., k - 1].set(1)
-      outs.append(f32(readout(head(jnp.concatenate([base, chan], -1), 2))))
-    return (jnp.moveaxis(w, -1, 0) * jnp.stack(outs, 0)).sum(0)
+    w = f32(feat['haw_head_event'])
+    ones = jnp.ones((*w.shape, 1), base.dtype)
+    out0 = f32(readout(head(jnp.concatenate([base, 0 * ones], -1), 2)))
+    out1 = f32(readout(head(jnp.concatenate([base, ones], -1), 2)))
+    return (1 - w) * out0 + w * out1
 
   def report(self, carry, data):
     if not self.config.report:

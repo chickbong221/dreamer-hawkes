@@ -18,12 +18,15 @@ across the whole run:
 `event_rate_obs`, `event_rate_error`, `event_hard_rate_obs`,
 `event_prob_entropy_obs`, `event_prob_std_time_obs`, `event_delta_mag_obs`,
 `event_rate_img`, `event_hard_rate_img`, `event_prob_entropy_img`,
-`event_delta_mag_img`, `event_type_entropy_sample`,
-`event_type_entropy_usage`, `event_type_effective_count`,
-`event_type_max_occupancy`, `event_type_min_occupancy`,
-`event_type_usage_obs/<k>`, `event_type_usage_img/<k>`, `haw_lam_mean`,
-`haw_lam_max`, `haw_state_mean`, `haw_state_max`, `haw_ctx_std`,
-`haw_base`, `haw_alpha`, `haw_beta`, `haw_valid_frac`.
+`event_delta_mag_img`, `event_prob_std_time_img`, `haw_prior_rate`,
+`haw_lam_mean`, `haw_lam_max`, `haw_mbar_std`, `haw_ctx_std`,
+`haw_base`, `haw_alpha`, `haw_beta`, `haw_valid_frac`,
+`haw_lam_fit_err`.
+
+Three more appear only in `report()` (`training=False`), because the
+deployment probe costs a second context-network evaluation:
+`haw_gap_teacher`, `haw_gap_deploy`, `haw_gap_memory`,
+`haw_gap_memory_rel`, `haw_probe_rate`, `haw_delta_mag_prior`.
 
 **Eval event panels** (this module) show only what an aggregate cannot: *where
 inside a single episode* events fire. Anything that would merely restate a
@@ -33,11 +36,12 @@ training metric is deliberately not logged here.
 
 | W&B key | Type | Content |
 |---|---|---|
-| `event/probs` | Line | `pi_t` over the episode |
-| `event/spike_trace` | Image | `[1 x T]` strip, colored by assigned type where an event fired |
+| `event/probs` | Line | detector `q_t` against Hawkes `p_t` |
+| `event/spike_trace` | Image | `[1 x T]` strip, red where the detector fired |
 | `event/episode_video` | Video | mp4 of the episode with a bar above the frame, red on spike steps |
 | `event/hard_count` | Scalar | events in the episode |
-| `event/expected_count` | Scalar | `sum(pi_t)` |
+| `event/expected_count` | Scalar | `sum(q_t)` |
+| `event/expected_count_prior` | Scalar | `sum(p_t)` |
 
 `lambda_t` is not plotted: `pi = 1 - exp(-lambda)` is a monotone transform of
 it, so it would be the same curve twice. The learned `b / alpha / beta` are
@@ -51,7 +55,8 @@ other four panels still appear.
 
 ## Capture path
 
-`Agent.policy()` surfaces `haw_prob`, `haw_event` and `haw_type` in `outs`, but only when `mode == 'eval'`. That gating matters: under
+`Agent.policy()` surfaces `haw_prob`, `haw_event` and `haw_prior_prob` in
+`outs`, but only when `mode == 'eval'`. That gating matters: under
 `mode='train'` the driver merges `outs` into the transitions written to
 replay, and `agent.train()` asserts the per-batch keys equal `self.spaces`
 exactly, so extra fields there would break training. `mode` is a
@@ -93,26 +98,21 @@ spikes.
 
 Other things worth watching:
 
-- **`event_prob` flat across the episode** means the event model has not
+- **`detector_q` flat across the episode** means the detector has not
   localized anything — the rate budget is satisfied but no timestep is
-  special. This is the constant-rate collapse mode; check
-  `event_prob_std_time_obs` in the training metrics, and only then reach for a
-  sharpness loss.
-- **`event_rate_img` far from `event_rate_obs`** means the prior-to-prior
-  latent delta is not in the same regime as the posterior-to-posterior one, so
-  imagined event timing drifts from observed. Compare `event_delta_mag_img`
-  against `event_delta_mag_obs`; the first intervention is disabling the
-  latent-delta channel, not changing the Hawkes recurrence.
-- **`haw_alpha` decaying to zero** means the Hawkes memory is not being used
-  and `g_eta` is carrying the whole prediction.
-- **`event_type_effective_count` near 1** is single-cluster collapse. Near
-  `K` with no visible difference between the strips of each type is the
-  opposite failure: `event_use` splitting identical events to fill the
-  budget. Lower `loss_scales.event_use` in that case.
-- **A type frequent in `event_type_usage_obs/<k>` and absent from
-  `event_type_usage_img/<k>`** is the posterior/prior mismatch showing up
-  per type. Cluster ids permute across runs, so compare distributions
-  rather than individual indices.
+  special. Check `event_prob_std_time_obs` in the training metrics.
+- **`haw_gap_teacher` small but `haw_gap_deploy` large** is the teacher/
+  deployment split: the Hawkes prior fits `q_t` using the posterior latent
+  delta and cannot reproduce it from the prior delta alone. That is the
+  headline risk of this design, and `event_rate_img` drifting from
+  `event_rate_obs` is the same thing seen from imagination.
+- **`haw_gap_memory_rel` near zero** means the Hawkes memory contributes
+  nothing and `g_eta` carries the whole prediction. Read it together with
+  `haw_alpha` and `haw_mbar_std`; `haw_alpha` alone can stay nonzero while
+  the network simply ignores variation in `M`.
+- **`haw_lam_fit_err` above ~1e-4** means the detached fitting recurrence no
+  longer reproduces the live one — a misalignment in the reset mask, the event
+  indexing, or the initial carry. See `TestFittingInvariant`.
 
 ## Dependencies
 
