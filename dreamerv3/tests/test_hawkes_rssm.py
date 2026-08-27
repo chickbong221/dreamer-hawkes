@@ -705,6 +705,13 @@ class TestLosses:
 
 _is_type = lambda k: '/type0' in k or '/typeout' in k
 _is_tprior = lambda k: '/tprior' in k
+# Per-channel weights. sum_k of a straight-through one-hot is identically 1
+# (sg(hard) - sg(prob) + prob), so a plain .sum() over the type axis is
+# gradient-free and would make the routing tests below vacuous. Every real
+# consumer meets each channel with a different weight: `_headfeat` concatenates
+# y*c into the head input, so each type hits a different column of the next
+# kernel.
+_weighted = lambda x: (f32(x) * (1.0 + jnp.arange(x.shape[-1], dtype=f32))).sum()
 
 
 class TestEventTypes:
@@ -774,6 +781,14 @@ class TestEventTypes:
     """sg(y) on the typed channel is what blocks the second route."""
     n = _grad_norms(
         lambda los, feat: _weighted(feat['haw_head_mix'][..., 1:]), _is_det)
+    assert n == 0.0, n
+
+  def test_summing_the_typed_channel_over_types_is_gradient_free(self):
+    """sum_k (sg(y) c_k) is exactly sg(y), so a consumer that only sees the
+    total typed mass trains nothing. This is why the two tests above weight
+    the channels, and why any future consumer must too."""
+    n = _grad_norms(
+        lambda los, feat: feat['haw_head_mix'][..., 1:].sum(), _is_type)
     assert n == 0.0, n
 
   def test_binary_head_channel_still_trains_the_detector(self):
