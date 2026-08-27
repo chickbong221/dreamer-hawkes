@@ -1,8 +1,18 @@
-"""Binary-event Hawkes RSSM for DreamerV3. Selected via `--dyn.typ hawkes`.
+"""Typed-event Hawkes RSSM for DreamerV3. Selected via `--dyn.typ hawkes`.
 
-Two networks with separate jobs. A posterior detector picks the events from
-what actually happened; a Hawkes prior, placed after the world-model update,
-learns to predict them and is what imagination deploys.
+Four learned components. The RSSM; a binary event posterior q_t that picks
+events from what actually happened; a Hawkes binary prior p_t placed after the
+world-model update, which is what imagination deploys; and an event-type pair
+(posterior c^+ from the observation, prior c^- for imagination).
+
+Both the binary event and its type reach the reward and continuation heads,
+but only the binary event reaches the RSSM recurrence, and their gradients
+stay on separate routes:
+
+  L_rew/con -> y_t      -> q_t -> D_psi        (binary route)
+  L_rew/con -> ct_st    -> C_phi               (type route)
+  L_rew/con -> C_phi  -X-> D_psi               (blocked by sg(y_t) on the
+                                                typed channel)
 
   e^H_{t-1} = omega(M_{t-1}, log1p(lam_{t-1}))
   h_t       = core(h_{t-1}, z_{t-1}, a_{t-1}, e^H_{t-1})
@@ -14,9 +24,13 @@ learns to predict them and is what imagination deploys.
   Mbar_t    = exp(-beta) M_{t-1}
   lam_t     = softplus(b + Mbar_t + g_eta(sg(h_t), symlog(d_t), m_t))
   p_t       = 1 - exp(-lam_t)                     the Hawkes prediction
-  q_t       = sigmoid(D_psi(a_{t-1}, symlog(sg(dx_t)), m^x_t))   the detector
+  xi_t      = [a_{t-1}, symlog(sg(dx_t)), m^x_t]                 detector input
+  q_t       = sigmoid(D_psi(xi_t))                the detector
   y_t       = straight-through Bernoulli(q_t) observing, Bernoulli(p_t) imagining
-  M_t       = Mbar_t + alpha y_t                  -> h_{t+1}
+  c^+_t     = softmax(C_phi([sg(xi_t), sg(q_t)]) / tau)          type posterior
+  ct_st     = straight-through onehot(argmax c^+_t)
+  chat_t    = softmax(P_theta(sg(h_t), symlog(d_t), m_t))        type prior
+  M_t       = Mbar_t + alpha y_t                  -> h_{t+1}, binary only
 
 y_t reaches h_{t+1}, never h_t. Observed events always come from the detector,
 imagined events always from the Hawkes prior.
@@ -26,9 +40,14 @@ and the *prior* delta while imagining, the way Dreamer's reward head trains on
 posterior features and runs on prior ones. The resulting input gap is measured
 rather than designed away -- see `_probes`, report-only.
 
-No sampled z_t enters the Hawkes context, in either path. The event therefore
-does not depend on the particular current categorical sample, only on how the
-distribution moved.
+No sampled z_t enters the Hawkes context or the type prior, in either path.
+The event therefore does not depend on the particular current categorical
+sample, only on how the distribution moved.
+
+`haw_head_mix` [..., 1 + K] carries the head routing: [1 - y, sg(y) ct_st]
+when observing, one-hot on the realized outcome; [1 - p, p c^-] when
+imagining, the true joint over the K + 1 outcomes. `_headfeat` reads y and
+y*c back out of it; `_headmix` uses it as marginalization weights.
 
 Two masks, kept logically separate:
   keep  = ~reset                    masks the incoming h, z, M, lam.
@@ -42,6 +61,9 @@ Losses: Dreamer's reward/cont heads and the delayed y_t -> M_t -> h_{t+1} path
 decide where events fire; `event_rate` is a two-sided KL budget on mean(q);
 `haw` fits b/alpha/beta/g_eta to detached detector statistics through an
 explicit recurrence, and has zero gradient into the detector or the RSSM.
+`event_conf` and `event_use` cluster the type posterior and reach only C_phi,
+since its inputs are detached. `event_type_prior` fits P_theta to a detached
+c^+ and reaches only P_theta.
 
 Hawkes scalars and the latent log-probs are float32 -- the recurrence
 accumulates, and differencing log-probs near log(u/C) underflows bfloat16.
@@ -60,6 +82,10 @@ import numpy as np
 
 f32 = jnp.float32
 sg = jax.lax.stop_gradient
+
+# Present on the raw observed features, absent from imagination, and
+# removed from `repfeat` before it reaches any Dreamer component.
+CLUSTER_ONLY = ('haw_type_prob', 'haw_obs_delta_mag')
 
 
 def _inv_softplus(y):
@@ -112,11 +138,15 @@ class HawkesRSSM(nj.Module):
   haw_init_alpha: float = 0.1
   haw_init_beta: float = 1.0
   haw_detector_outscale: float = 0.1  # nonzero: frames must differ at init
+  haw_types: int = 4                  # K
+  haw_type_temp: float = 1.0          # tau
 
   def __init__(self, act_space, **kw):
     assert self.deter % self.blocks == 0
     assert self.obs_dim > 0, self.obs_dim
     assert 0.0 < self.haw_target_rate < 1.0, self.haw_target_rate
+    assert self.haw_types >= 2, self.haw_types
+    assert self.haw_type_temp > 0.0, self.haw_type_temp  # divides the logits
     # _event_repr takes a log; the unimix floor is what keeps it finite.
     assert self.unimix > 0.0, self.unimix
     self.act_space = act_space
@@ -245,29 +275,81 @@ class HawkesRSSM(nj.Module):
     _, alpha, _ = self._haw_params()
     return mbar + alpha * event
 
-  def _detector(self, action, delta):
-    """q_t from the previous action and the detached encoder delta only.
+  def _detector_input(self, action, delta):
+    """xi_t and its unsquashed scale channel; the delta is detached here.
 
     symlog keeps the delta scale-preserving (an RMS norm would erase the
-    magnitude that distinguishes an event); `mag` restores one unsquashed
-    scale channel. The output layer is deliberately not zero-initialized:
-    different visual transitions must score differently from step one, or the
-    rate budget is already satisfied by a constant and nothing breaks the
-    symmetry. `logit(rho)` is the layer's bias -- do not add it again outside.
+    magnitude that distinguishes an event); `mag` restores one raw scale
+    channel. Shared verbatim with the type posterior, which reads sg(xi_t).
     """
     delta = sg(f32(delta))
     mag = jnp.log1p(jnp.sqrt(jnp.square(delta).mean(-1) + 1e-8))
-    x = jnp.concatenate([
+    inp = jnp.concatenate([
         nn.cast(action),
         nn.cast(nn.symlog(delta)),
         nn.cast(mag)[..., None]], -1)
-    x = self.sub('det0', nn.Linear, self.haw_hidden, **self.kw)(x)
+    return inp, f32(mag)
+
+  def _detector(self, inp):
+    """q_t from xi_t.
+
+    The output layer is deliberately not zero-initialized: different visual
+    transitions must score differently from step one, or the rate budget is
+    already satisfied by a constant and nothing breaks the symmetry.
+    `logit(rho)` is the layer's bias -- do not add it again outside.
+    """
+    x = self.sub('det0', nn.Linear, self.haw_hidden, **self.kw)(inp)
     x = nn.act(self.act)(self.sub('det0norm', nn.Norm, self.norm)(x))
     kw = dict(
         **self.kw, outscale=self.haw_detector_outscale,
         binit=_const_init(self._init_det_bias))
     logit = self.sub('detout', nn.Linear, 1, **kw)(x)
     return jax.nn.sigmoid(f32(logit[..., 0]))
+
+  def _type_post(self, inp, prob):
+    """c^+_t from [sg(xi_t), sg(q_t)] -> [..., K] f32.
+
+    A separate trunk from the detector, reading only detached inputs, so the
+    clustering losses and the typed reward route can never reach D_psi. Not
+    zero-initialized: at exactly uniform logits the assignment entropy sits at
+    a zero-gradient saddle.
+    """
+    x = jnp.concatenate([nn.cast(sg(inp)), nn.cast(sg(prob))[..., None]], -1)
+    x = self.sub('type0', nn.Linear, self.haw_hidden, **self.kw)(x)
+    x = nn.act(self.act)(self.sub('type0norm', nn.Norm, self.norm)(x))
+    logits = f32(self.sub('typeout', nn.Linear, self.haw_types, **self.kw)(x))
+    return jax.nn.softmax(logits / float(self.haw_type_temp), -1)
+
+  def _type_prior(self, deter, delta, mag):
+    """chat_t / c^-_t -> [..., K] f32, the deployable type prediction.
+
+    Same inputs as the Hawkes context but a separate trunk: it must not be
+    able to move g_eta, and it never sees q_t, p_t or a sampled z_t.
+    """
+    flat = lambda x: x.reshape((*x.shape[:-2], -1))
+    x = jnp.concatenate([
+        nn.cast(sg(deter)),
+        nn.cast(nn.symlog(flat(sg(delta)))),
+        nn.cast(mag)], -1)
+    x = self.sub('tprior0', nn.Linear, self.haw_hidden, **self.kw)(x)
+    x = nn.act(self.act)(self.sub('tprior0norm', nn.Norm, self.norm)(x))
+    logits = f32(
+        self.sub('tpriorout', nn.Linear, self.haw_types, **self.kw)(x))
+    return jax.nn.softmax(logits / float(self.haw_type_temp), -1)
+
+  def _straight_onehot(self, prob):
+    """Hard forward, soft backward: the head sees one discrete type."""
+    hard = jax.nn.one_hot(jnp.argmax(prob, -1), self.haw_types, dtype=f32)
+    return sg(hard - prob) + prob
+
+  def _head_mix(self, event, typed):
+    """[1 - y, sg(y) * c] -> [..., 1 + K], summing to one.
+
+    sg on the binary factor of the typed channel is what keeps the type route
+    from opening a second gradient into the detector.
+    """
+    return jnp.concatenate([
+        (1.0 - event)[..., None], sg(event)[..., None] * typed], -1)
 
   def _hawkes_embed(self, state, lam):
     """omega([M_{t-1}, log1p(lam_{t-1})]) -> [..., haw_embed], compute dtype.
@@ -340,7 +422,8 @@ class HawkesRSSM(nj.Module):
 
     # Detector sees o_t but only reaches h_{t+1}.
     dx = nn.mask(tokens_flat - carry['haw_prev_obs'], valid)
-    prob = jnp.where(valid, self._detector(action, dx), 0.0)
+    det_in, obs_mag = self._detector_input(action, dx)
+    prob = jnp.where(valid, self._detector(det_in), 0.0)
     if sample_event:
       draw = f32(jax.random.bernoulli(nj.seed(), prob))
       event = sg(draw - prob) + prob
@@ -348,6 +431,13 @@ class HawkesRSSM(nj.Module):
       event = f32(prob >= self.haw_eval_threshold)
     event = jnp.where(valid, event, 0.0)
     haw_state = self._hawkes_update(mbar, event)
+
+    # Event type. The posterior reads the detached detector input; the prior
+    # reads what imagination will also have. Neither touches the recurrence.
+    type_prob = self._type_post(det_in, prob)
+    uniform = jnp.full_like(type_prob, 1.0 / self.haw_types)
+    type_prob = jnp.where(valid[..., None], type_prob, uniform)
+    type_prior = self._type_prior(deter, delta, mag)
 
     carry = dict(
         deter=deter, stoch=stoch, haw_state=haw_state, haw_lam=lam,
@@ -360,9 +450,14 @@ class HawkesRSSM(nj.Module):
         deter=deter, stoch=stoch, haw_state=haw_state, haw_lam=lam)
     feat = dict(
         deter=deter, stoch=stoch, logit=logit,
-        haw_prob=prob, haw_event=event, haw_head_event=event,
+        haw_prob=prob, haw_event=event,
+        haw_head_mix=self._head_mix(
+            event, self._straight_onehot(type_prob)),
         haw_prior_prob=prior_prob, haw_lam=lam, haw_ctx=ctx,
-        haw_delta_mag=mag.mean(-1), haw_valid=f32(valid))
+        haw_delta_mag=mag.mean(-1), haw_valid=f32(valid),
+        haw_type_prior_prob=type_prior,
+        # Diagnostic only; HawkesRSSM.loss() strips both before returning.
+        haw_type_prob=type_prob, haw_obs_delta_mag=obs_mag)
     assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
     return carry, (entry, feat)
 
@@ -379,10 +474,12 @@ class HawkesRSSM(nj.Module):
           repr_t, carry['haw_prev_repr'], carry['haw_prev_valid'])
       ctx = self._context(deter, delta, mag)
       mbar, lam, prior_prob = self._hawkes_probs(carry['haw_state'], ctx)
-      # Hard draw keeps the imagined event history on-distribution. No
-      # straight-through: imagined features are detached before actor/critic.
+      # Hard draw keeps the imagined event history on the discrete support the
+      # recurrence was trained on. No straight-through: imagined features are
+      # detached before actor/critic. The heads marginalize instead.
       event = f32(jax.random.bernoulli(nj.seed(), prior_prob))
       haw_state = self._hawkes_update(mbar, event)
+      type_prior = self._type_prior(deter, delta, mag)
       carry = dict(
           deter=deter, stoch=stoch, haw_state=haw_state, haw_lam=lam,
           haw_prev_repr=repr_t,
@@ -390,12 +487,14 @@ class HawkesRSSM(nj.Module):
       feat = dict(
           deter=deter, stoch=stoch, logit=logit,
           haw_prob=prior_prob, haw_event=event,
-          # Marginalization weight for the reward/cont heads: keeps their
-          # input on the {0, 1} support they were trained on, without the
-          # return noise of a hard sample.
-          haw_head_event=prior_prob,
+          # The true joint over the K + 1 outcomes, so the reward and cont
+          # heads marginalize exactly without the noise of a hard sample.
+          haw_head_mix=jnp.concatenate([
+              (1.0 - prior_prob)[..., None],
+              prior_prob[..., None] * type_prior], -1),
           haw_prior_prob=prior_prob, haw_lam=lam, haw_ctx=ctx,
-          haw_delta_mag=mag.mean(-1), haw_valid=jnp.ones_like(prior_prob))
+          haw_delta_mag=mag.mean(-1), haw_valid=jnp.ones_like(prior_prob),
+          haw_type_prior_prob=type_prior)
       assert all(x.dtype == nn.COMPUTE_DTYPE for x in (deter, stoch, logit))
       return carry, (feat, action)
     else:
@@ -403,13 +502,17 @@ class HawkesRSSM(nj.Module):
       # Drop the observation-only field: report() hands us a full observe
       # carry, and the scan carry structure has to match what the imagined
       # step returns.
+      deter = nn.cast(carry['deter'])
       carry = dict(
-          deter=nn.cast(carry['deter']),
+          deter=deter,
           stoch=nn.cast(carry['stoch']),
           haw_state=f32(carry['haw_state']),
           haw_lam=f32(carry['haw_lam']),
-          haw_prev_repr=f32(carry['haw_prev_repr']),
-          haw_prev_valid=carry['haw_prev_valid'].astype(bool))
+          # Rebuilt, never trusted: an observe carry holds the *posterior*
+          # representation, which would make the first imagined delta
+          # posterior-to-prior. Idempotent on the output of starts().
+          haw_prev_repr=self._event_repr(self._prior(deter)),
+          haw_prev_valid=jnp.ones(deter.shape[0], bool))
       if callable(policy):
         carry, (feat, action) = nj.scan(
             lambda c, _: self.imagine(c, policy, 1, training, single=True),
@@ -429,8 +532,12 @@ class HawkesRSSM(nj.Module):
     init_state = f32(carry['haw_state'])
     init_deter = nn.cast(carry['deter'])
 
+    # Always sampled, including when reporting: thresholded events are all
+    # zero while q sits near rho, which would empty the Hawkes memory and
+    # make the memory probe read a false collapse. The eval threshold still
+    # applies in Agent.policy().
     carry, entries, feat = self.observe(
-        carry, tokens, acts, reset, training, sample_event=training)
+        carry, tokens, acts, reset, training, sample_event=True)
     prior = self._prior(feat['deter'])
     post = feat['logit']
     dyn = self._dist(sg(post)).kl(self._dist(prior))
@@ -448,6 +555,7 @@ class HawkesRSSM(nj.Module):
     prob = feat['haw_prob']              # [B, T] f32, the detector
     nvalid = jnp.maximum(1.0, valid.sum())
     wmean = lambda x: (valid * x).sum() / nvalid
+    bcast = lambda x: jnp.broadcast_to(x, prob.shape)
 
     # Event-rate budget on the detector. Two-sided: KL(Ber(rho) || Ber(mean q))
     # diverges as the rate goes to zero, so a collapsing detector is pushed up.
@@ -458,7 +566,7 @@ class HawkesRSSM(nj.Module):
     rate_kl = (
         rho * (np.log(rho) - jnp.log(rate_c)) +
         (1.0 - rho) * (np.log1p(-rho) - jnp.log1p(-rate_c)))
-    losses['event_rate'] = jnp.broadcast_to(rate_kl, prob.shape)
+    losses['event_rate'] = bcast(rate_kl)
 
     # Detached fitting recurrence: same forward values as the live one, but the
     # event history is detached so this trains only b/alpha/beta/g_eta. It
@@ -488,12 +596,39 @@ class HawkesRSSM(nj.Module):
         q * (jnp.log(q) - jnp.log(p)) +
         (1.0 - q) * (jnp.log1p(-q) - jnp.log1p(-p)))
 
+    # ------------------------------------------------------------- types --
+    # Every input to C_phi and P_theta is detached, so these three losses
+    # reach only their own trunks: never the detector, the Hawkes prior or
+    # the RSSM. w_t is the soft event mass.
+    K = self.haw_types
+    w = sg(valid * prob)                                    # [B, T]
+    total = w.sum()
+    denom = jnp.maximum(total, 1e-8)
+    cpost = jnp.clip(feat['haw_type_prob'], 1e-8, 1.0)      # [B, T, K]
+    losses['event_conf'] = bcast(
+        (w * -(cpost * jnp.log(cpost)).sum(-1)).sum() / denom)
+    mass = (w[..., None] * cpost).sum((0, 1))               # [K]
+    # An all-invalid batch has no event mass; uniform makes both terms
+    # exactly zero rather than 0/0.
+    cbar = jnp.where(
+        total > 0, mass / denom, jnp.full_like(mass, 1.0 / K))
+    losses['event_use'] = bcast((cbar * (jnp.log(cbar) + np.log(K))).sum())
+
+    cprior = jnp.clip(feat['haw_type_prior_prob'], 1e-8, 1.0)
+    type_kl = (sg(cpost) * (jnp.log(sg(cpost)) - jnp.log(cprior))).sum(-1)
+    losses['event_type_prior'] = bcast((w * type_kl).sum() / denom)
+
     metrics['event_rate_obs'] = rate
     metrics['event_rate_error'] = rate - rho
     metrics['event_hard_rate_obs'] = wmean(feat['haw_event'])
     metrics['event_prob_entropy_obs'] = wmean(
         -(q * jnp.log(q) + (1.0 - q) * jnp.log1p(-q)))
-    metrics['event_prob_std_time_obs'] = prob.std(1).mean()
+    # Validity weighted: the forced zeros at resets and replay boundaries
+    # are not temporal variation.
+    vsum = jnp.maximum(valid.sum(1), 1.0)
+    vmean = (valid * prob).sum(1) / vsum
+    vvar = (valid * jnp.square(prob - vmean[:, None])).sum(1) / vsum
+    metrics['event_prob_std_time_obs'] = jnp.sqrt(vvar + 1e-12).mean()
     metrics['event_delta_mag_obs'] = wmean(feat['haw_delta_mag'])
     metrics['haw_prior_rate'] = wmean(feat['haw_prior_prob'])
     metrics['haw_lam_mean'] = wmean(feat['haw_lam'])
@@ -503,6 +638,30 @@ class HawkesRSSM(nj.Module):
     metrics['haw_base'] = base
     metrics['haw_alpha'] = alpha
     metrics['haw_beta'] = beta
+    usage_ent = -(cbar * jnp.log(cbar)).sum()
+    metrics['event_type_entropy_sample'] = losses['event_conf'][0, 0]
+    metrics['event_type_entropy_usage'] = usage_ent
+    metrics['event_type_effective_count'] = jnp.exp(usage_ent)
+    metrics['event_type_max_occupancy'] = cbar.max()
+    metrics['event_type_min_occupancy'] = cbar.min()
+    metrics['event_type_prior_kl'] = (w * type_kl).sum() / denom
+    # Per-type conditional statistics. A large prob spread with a small
+    # magnitude spread is the signature of the head simply binning q.
+    wk = w[..., None] * cpost                               # [B, T, K]
+    nk = jnp.maximum(wk.sum((0, 1)), 1e-8)                  # [K]
+    qk = (wk * prob[..., None]).sum((0, 1)) / nk
+    magk = (wk * feat['haw_obs_delta_mag'][..., None]).sum((0, 1)) / nk
+    qvar = (wk * jnp.square(prob[..., None] - qk)).sum((0, 1)) / nk
+    qall = jnp.sqrt(
+        (w * jnp.square(prob - (w * prob).sum() / denom)).sum() / denom)
+    metrics['event_type_prob_spread'] = (
+        (qk.max() - qk.min()) / (rate + 1e-8))
+    metrics['event_type_prob_within_ratio'] = (
+        (cbar * jnp.sqrt(qvar + 1e-12)).sum() / (qall + 1e-8))
+    for k in range(K):
+      metrics[f'event_type_usage_obs/{k}'] = cbar[k]
+      metrics[f'event_type_prob_mean/{k}'] = qk[k]
+      metrics[f'event_type_detector_mag_mean/{k}'] = magk[k]
     metrics['haw_valid_frac'] = valid.mean()
     # Live guard on the fitting invariant; nonzero means a misalignment in the
     # reset mask, the event indexing, or the initial carry.
@@ -512,6 +671,12 @@ class HawkesRSSM(nj.Module):
     if not training:
       metrics.update(self._probes(
           init_deter, prior, feat, reset, mbar_fit, valid, nvalid))
+
+    # Diagnostic-only fields never reach Dreamer: dropping them here is also
+    # what keeps the observed and imagined feature trees identical at the
+    # concatenation in Agent.loss(). `haw_head_mix` stays -- the reward and
+    # continuation heads read it.
+    feat = {k: v for k, v in feat.items() if k not in CLUSTER_ONLY}
     return carry, entries, losses, feat, metrics
 
   def _probes(self, init_deter, prior, feat, reset, mbar_fit, valid, nvalid):

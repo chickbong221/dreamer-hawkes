@@ -22,6 +22,20 @@ concat = lambda xs, a: jax.tree.map(lambda *x: jnp.concatenate(x, a), *xs)
 isimage = lambda s: s.dtype in (np.uint8, np.uint16) and len(s.shape) == 3
 
 
+def _dyn_policy_kw(hawkes, mode):
+  """Dynamics kwargs for a policy step.
+
+  `mode` deliberately does not appear: evaluation samples events exactly like
+  training, so every recurrent path sees the same event distribution. The 0.5
+  threshold survives only as an explicit diagnostic via `sample_event=False`.
+  """
+  del mode
+  kw = dict(training=False, single=True)
+  if hawkes:
+    kw['sample_event'] = True
+  return kw
+
+
 def _bern_ent(p):
   """Mean Bernoulli entropy in nats; low means the events are sharp."""
   p = jnp.clip(f32(p), 1e-6, 1.0 - 1e-6)
@@ -97,7 +111,8 @@ class Agent(embodied.jax.Agent):
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
     if not self.hawkes:
-      for key in ('haw', 'event_rate'):
+      for key in ('haw', 'event_rate', 'event_conf', 'event_use',
+                  'event_type_prior'):
         scales.pop(key, None)
     self.scales = scales
 
@@ -136,11 +151,8 @@ class Agent(embodied.jax.Agent):
     kw = dict(training=False, single=True)
     reset = obs['is_first']
     enc_carry, enc_entry, tokens = self.enc(enc_carry, obs, reset, **kw)
-    dynkw = dict(kw)
-    if self.hawkes:
-      dynkw['sample_event'] = (mode != 'eval')
     dyn_carry, dyn_entry, feat = self.dyn.observe(
-        dyn_carry, tokens, prevact, reset, **dynkw)
+        dyn_carry, tokens, prevact, reset, **_dyn_policy_kw(self.hawkes, mode))
     dec_entry = {}
     if dec_carry:
       dec_carry, dec_entry, recons = self.dec(dec_carry, feat, reset, **kw)
@@ -156,7 +168,8 @@ class Agent(embodied.jax.Agent):
     # and the train assertion `data.keys() == self.spaces.keys()` rejects
     # any extra fields. eval-mode outs are consumed locally and discarded.
     if self.hawkes and mode == 'eval':
-      for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
+      for key in ('haw_prob', 'haw_event', 'haw_prior_prob',
+                  'haw_type_prob'):
         out[key] = feat[key]
     carry = (enc_carry, dyn_carry, dec_carry, act)
     if self.config.replay_context:
@@ -238,6 +251,10 @@ class Agent(embodied.jax.Agent):
           'event_prob_entropy_img': _bern_ent(imgfeat['haw_prob']),
           'event_prob_std_time_img': f32(imgfeat['haw_prob']).std(1).mean(),
           'event_delta_mag_img': f32(imgfeat['haw_delta_mag']).mean()})
+      cbar = f32(imgfeat['haw_type_prior_prob']).mean((0, 1))
+      metrics.update({
+          f'event_type_usage_img/{k}': cbar[k]
+          for k in range(cbar.shape[-1])})
     first = jax.tree.map(
         lambda x: x[:, -K:].reshape((B * K, 1, *x.shape[2:])), repfeat)
     imgfeat = concat([sg(first, skip=self.config.ac_grads), sg(imgfeat)], 1)
@@ -247,10 +264,19 @@ class Agent(embodied.jax.Agent):
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgfeat))
     assert all(x.shape[:2] == (B * K, H + 1) for x in jax.tree.leaves(imgact))
     inp = self.feat2tensor(imgfeat)
+    rewmix, rewspread = self._headmix(
+        self.rew, imgfeat, lambda o: o.pred(), spread=True)
+    conmix, conspread = self._headmix(
+        self.con, imgfeat, lambda o: o.prob(1), spread=True)
+    if self.hawkes:
+      # Near zero means the heads are reading the binary event and ignoring
+      # which type it was.
+      metrics['event_type_reward_spread'] = rewspread
+      metrics['event_type_cont_spread'] = conspread
     los, imgloss_out, mets = imag_loss(
         imgact,
-        self._headmix(self.rew, imgfeat, lambda o: o.pred()),
-        self._headmix(self.con, imgfeat, lambda o: o.prob(1)),
+        rewmix,
+        conmix,
         self.pol(inp, 2),
         self.val(inp, 2),
         self.slowval(inp, 2),
@@ -292,29 +318,50 @@ class Agent(embodied.jax.Agent):
     return loss, (carry, entries, outs, metrics)
 
   def _headfeat(self, feat):
-    """Base feature, plus the binary event for the reward/cont heads."""
+    """Base feature, plus the binary event and its typed one-hot.
+
+    Both are read back out of `haw_head_mix`, which is one-hot on the realized
+    outcome while observing: y from channel 0, y*c from the rest. y carries
+    gradient to the detector; y*c carries gradient to the classifier only,
+    because the binary factor there is stop-gradded.
+    """
     x = self.feat2tensor(feat)
     if not self.hawkes:
       return x
-    return jnp.concatenate(
-        [x, nn.cast(feat['haw_head_event'])[..., None]], -1)
+    mix = nn.cast(feat['haw_head_mix'])
+    return jnp.concatenate([x, 1.0 - mix[..., :1], mix[..., 1:]], -1)
 
-  def _headmix(self, head, feat, readout):
-    """E_y[readout(head)] over the binary event.
+  def _headmix(self, head, feat, readout, spread=False):
+    """E[readout(head)] over the K + 1 event outcomes.
 
-    Evaluates the head only at y in {0, 1}, so it never leaves the support it
-    was trained on. Exact for observed steps (weight is already 0 or 1) and
-    the exact expectation for imagined steps (weight is the Hawkes p_t),
-    without the return noise of a hard sample.
+    Evaluates the head at no-event and at each typed event, so it never leaves
+    the support it was trained on. `haw_head_mix` is one-hot on the realized
+    outcome for observed steps and the joint (1 - p, p c_k) for imagined ones,
+    so this is exact in both cases. `spread` additionally returns the range of
+    the head across the K typed outcomes -- near zero means the head is
+    ignoring the type.
+
+    Unrolled rather than folded into one batched call: the K + 1 copies of
+    `base` would be the largest activation in the imagination path.
     """
     if not self.hawkes:
-      return readout(head(self.feat2tensor(feat), 2))
+      out = readout(head(self.feat2tensor(feat), 2))
+      return (out, jnp.zeros((), f32)) if spread else out
     base = self.feat2tensor(feat)
-    w = f32(feat['haw_head_event'])
-    ones = jnp.ones((*w.shape, 1), base.dtype)
-    out0 = f32(readout(head(jnp.concatenate([base, 0 * ones], -1), 2)))
-    out1 = f32(readout(head(jnp.concatenate([base, ones], -1), 2)))
-    return (1 - w) * out0 + w * out1
+    w = f32(feat['haw_head_mix'])
+    K = w.shape[-1] - 1
+    zeros = jnp.zeros((*base.shape[:-1], 1 + K), base.dtype)
+    outs = []
+    for k in range(K + 1):
+      # Channel 0 is y; channels 1: are y * onehot(type).
+      chan = zeros if k == 0 else zeros.at[..., 0].set(1).at[..., k].set(1)
+      outs.append(f32(readout(head(jnp.concatenate([base, chan], -1), 2))))
+    stack = jnp.stack(outs, 0)
+    mixed = (jnp.moveaxis(w, -1, 0) * stack).sum(0)
+    if spread:
+      ev = stack[1:]
+      return mixed, (ev.max(0) - ev.min(0)).mean()
+    return mixed
 
   def report(self, carry, data):
     if not self.config.report:
@@ -329,7 +376,7 @@ class Agent(embodied.jax.Agent):
     # Train metrics
     _, (new_carry, entries, outs, mets) = self.loss(
         carry, obs, prevact, training=False)
-    mets.update(mets)
+    metrics.update(mets)
 
     # Grad norms
     if self.config.report_gradnorms:

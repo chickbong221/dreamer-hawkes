@@ -21,6 +21,7 @@ from dreamerv3.hawkes_rssm import HawkesRSSM  # noqa: E402
 
 B, T, OBS, ACT = 3, 6, 12, 4
 DETER, STOCH, CLASSES, UNIMIX, RHO = 32, 4, 4, 0.01, 0.1
+TYPES = 4
 f32 = jnp.float32
 
 
@@ -28,7 +29,7 @@ def make_dyn(**kw):
   base = dict(
       obs_dim=OBS, deter=DETER, hidden=16, stoch=STOCH, classes=CLASSES,
       blocks=4, act='silu', norm='rms', unimix=UNIMIX, haw_hidden=16,
-      haw_embed=8, haw_context_hidden=8, haw_target_rate=RHO)
+      haw_embed=8, haw_context_hidden=8, haw_target_rate=RHO, haw_types=TYPES)
   base.update(kw)
   act_space = {'action': elements.Space(np.float32, (ACT,), -1, 1)}
   return HawkesRSSM(act_space, **base, name='dyn')
@@ -184,7 +185,8 @@ class TestShapesAndMasking:
     assert np.allclose(np.asarray(out['haw_state']), 0.7)
     assert np.allclose(np.asarray(out['haw_lam']), 0.3)
 
-  def test_eval_mode_thresholds_deterministically(self):
+  def test_explicit_nonsampling_mode_thresholds_deterministically(self):
+    """Only the diagnostic path; normal evaluation samples."""
     dyn = make_dyn(haw_eval_threshold=0.5)
     _, _, feat = observe(
         dyn, *make_batch(), training=False, sample_event=False)
@@ -399,7 +401,7 @@ class TestGradientRouting:
 
   def test_head_event_trains_the_detector(self):
     """The route the reward and continuation heads use."""
-    n = _grad_norms(lambda los, feat: feat['haw_head_event'].sum(), _is_det)
+    n = _grad_norms(lambda los, feat: (1.0 - feat['haw_head_mix'][..., 0]).sum(), _is_det)
     assert n > 0.0, n
 
   def test_delayed_world_model_path_trains_the_detector(self):
@@ -411,7 +413,7 @@ class TestGradientRouting:
   def test_delayed_path_is_not_vanishing(self):
     """Guard against a dead omega: compare against the direct head route."""
     direct = _grad_norms(
-        lambda los, feat: feat['haw_head_event'].sum(), _is_det)
+        lambda los, feat: (1.0 - feat['haw_head_mix'][..., 0]).sum(), _is_det)
     delayed = _grad_norms(
         lambda los, feat: feat['deter'][:, 2:].astype(f32).sum(), _is_det)
     assert delayed > 1e-4 * direct, (delayed, direct)
@@ -510,12 +512,36 @@ class TestImagination:
 
     return init_and_run(fn, tokens, acts, reset, imgacts)[1]
 
-  def test_observed_and_imagined_feature_trees_match(self):
-    feat, _, imgfeat = self._observe_then_imagine(make_dyn())
-    assert set(feat.keys()) == set(imgfeat.keys()), set(feat) ^ set(imgfeat)
-    for key in feat:
-      assert feat[key].dtype == imgfeat[key].dtype, key
-      assert feat[key].shape[2:] == imgfeat[key].shape[2:], key
+  def test_stripped_repfeat_matches_the_imagined_tree(self):
+    """The invariant that matters is at Agent.loss()'s concat: raw observed
+    features carry diagnostic-only fields, `loss()` drops them, and what comes
+    back must line up with imagination key for key."""
+    dyn = make_dyn()
+    tokens, acts, reset = make_batch()
+    imgacts = {'action': jnp.zeros((B * 2, 3, ACT), f32)}
+
+    def fn(tokens, acts, reset, imgacts):
+      carry = dyn.initial(B)
+      _, entries, _, repfeat, _ = dyn.loss(
+          carry, tokens, acts, reset, training=True)
+      livecarry, rawfeat = dyn.observe(
+          dyn.initial(B), tokens, acts, reset, training=True)[0::2]
+      starts = dyn.starts(entries, livecarry, 2)
+      _, imgfeat, _ = dyn.imagine(starts, imgacts, 3, training=True)
+      return repfeat, rawfeat, imgfeat
+
+    _, (repfeat, rawfeat, imgfeat) = init_and_run(
+        fn, tokens, acts, reset, imgacts)
+    assert set(repfeat.keys()) == set(imgfeat.keys()), (
+        set(repfeat) ^ set(imgfeat))
+    for key in repfeat:
+      assert repfeat[key].dtype == imgfeat[key].dtype, key
+      assert repfeat[key].shape[2:] == imgfeat[key].shape[2:], key
+    # The diagnostic fields exist upstream and only upstream.
+    for key in ('haw_type_prob', 'haw_obs_delta_mag'):
+      assert key in rawfeat, key
+      assert key not in repfeat, key
+      assert key not in imgfeat, key
 
   def test_imagined_carry_drops_the_observation_only_field(self):
     _, imgcarry, _ = self._observe_then_imagine(make_dyn())
@@ -527,14 +553,23 @@ class TestImagination:
     _, _, imgfeat = self._observe_then_imagine(make_dyn())
     prob = np.asarray(imgfeat['haw_prob'])
     assert np.allclose(prob, np.asarray(imgfeat['haw_prior_prob']))
-    assert np.allclose(prob, np.asarray(imgfeat['haw_head_event']))
+    mix = np.asarray(imgfeat['haw_head_mix'])
+    assert np.allclose(mix[..., 0], 1.0 - prob, atol=1e-5)
+    assert np.allclose(
+        mix[..., 1:],
+        prob[..., None] * np.asarray(imgfeat['haw_type_prior_prob']),
+        atol=1e-5)
     ev = np.asarray(imgfeat['haw_event'])
     assert np.isin(ev, (0.0, 1.0)).all(), np.unique(ev)
 
-  def test_observed_head_event_is_the_realized_detector_event(self):
+  def test_observed_head_mix_is_one_hot_on_the_realized_outcome(self):
     feat, _, _ = self._observe_then_imagine(make_dyn())
-    assert np.allclose(
-        np.asarray(feat['haw_head_event']), np.asarray(feat['haw_event']))
+    mix = np.asarray(feat['haw_head_mix'])
+    assert mix.shape[-1] == TYPES + 1
+    assert np.allclose(mix.sum(-1), 1.0, atol=1e-5)
+    assert np.isin(mix, (0.0, 1.0)).all(), np.unique(mix)
+    # Channel 0 is 1 - y, so the rest carry exactly the realized event.
+    assert np.allclose(1.0 - mix[..., 0], np.asarray(feat['haw_event']))
 
   def test_imagination_accepts_a_full_observe_carry(self):
     """report() hands imagine() the observation carry, not starts()."""
@@ -549,6 +584,27 @@ class TestImagination:
 
     _, imgfeat = init_and_run(fn, tokens, acts, reset, imgacts)
     assert np.isfinite(np.asarray(imgfeat['haw_prob'])).all()
+
+  def test_imagination_ignores_the_incoming_representation(self):
+    """report() hands over an observe carry holding the *posterior* r, so
+    imagine() must rebuild the prior one or the first imagined delta is
+    posterior-to-prior."""
+    dyn = make_dyn()
+    imgacts = {'action': jnp.zeros((B, 3, ACT), f32)}
+
+    def fn(repr_in, imgacts):
+      carry = dict(dyn.initial(B))
+      carry['haw_prev_repr'] = repr_in
+      return dyn.imagine(carry, imgacts, 3, training=False)[1]
+
+    zeros = jnp.zeros((B, STOCH, CLASSES), f32)
+    junk = jnp.full((B, STOCH, CLASSES), -3.0, f32)
+    params = wake_ctx(nj.init(fn)({}, zeros, imgacts, seed=0))
+    a = nj.pure(fn)(params, zeros, imgacts, seed=0)[1]
+    b = nj.pure(fn)(params, junk, imgacts, seed=0)[1]
+    for key in ('haw_prob', 'haw_ctx', 'haw_delta_mag'):
+      assert np.allclose(
+          np.asarray(a[key]), np.asarray(b[key]), atol=1e-6), key
 
   def test_long_imagination_stays_finite(self):
     _, _, imgfeat = self._observe_then_imagine(make_dyn(), length=64, nlast=1)
@@ -569,8 +625,9 @@ class TestLosses:
 
   def test_loss_keys_and_shapes(self):
     losses, _, mets = run_loss(make_dyn())
-    assert set(losses.keys()) == {'dyn', 'rep', 'haw', 'event_rate'}, sorted(
-        losses)
+    assert set(losses.keys()) == {
+        'dyn', 'rep', 'haw', 'event_rate', 'event_conf', 'event_use',
+        'event_type_prior'}, sorted(losses)
     for key, value in losses.items():
       assert value.shape == (B, T), (key, value.shape)
     assert np.isfinite(
@@ -618,3 +675,131 @@ class TestLosses:
     _, _, mets = run_loss(
         make_dyn(haw_init_alpha=1e-8), resets=(0,), training=False)
     assert float(mets['haw_gap_memory']) < 1e-6, mets['haw_gap_memory']
+
+  def test_prob_std_time_ignores_invalid_steps(self):
+    """Forced zeros at resets and replay boundaries are not variation."""
+    _, feat, mets = run_loss(make_dyn(), resets=(0, 3))
+    valid = np.asarray(feat['haw_valid'])
+    q = np.asarray(feat['haw_prob'])
+    n = np.maximum(valid.sum(1), 1.0)
+    mu = (valid * q).sum(1) / n
+    var = (valid * (q - mu[:, None]) ** 2).sum(1) / n
+    want = float(np.sqrt(var + 1e-12).mean())
+    assert np.allclose(float(mets['event_prob_std_time_obs']), want, atol=1e-6)
+    # The unweighted version counts the forced zeros and reads much larger.
+    assert float(mets['event_prob_std_time_obs']) < float(q.std(1).mean())
+
+  def test_report_loss_samples_events(self):
+    """Thresholded events would be all zero near rho, emptying the Hawkes
+    memory and making the memory probe read a false collapse."""
+    # High target rate so this cannot fail on an unlucky draw: at rho=0.1
+    # over 15 valid steps, P(no event) would be ~20%.
+    _, feat, _ = run_loss(
+        make_dyn(haw_target_rate=0.8), resets=(), training=False)
+    assert np.asarray(feat['haw_event']).sum() > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Event types
+# ---------------------------------------------------------------------------
+
+_is_type = lambda k: '/type0' in k or '/typeout' in k
+_is_tprior = lambda k: '/tprior' in k
+
+
+class TestEventTypes:
+
+  def test_type_probabilities_are_distributions(self):
+    _, _, feat = observe(make_dyn(), *make_batch())
+    for key in ('haw_type_prob', 'haw_type_prior_prob'):
+      c = np.asarray(feat[key])
+      assert c.shape == (B, T, TYPES), (key, c.shape)
+      assert c.dtype == f32, key
+      assert np.isfinite(c).all(), key
+      assert np.allclose(c.sum(-1), 1.0, atol=1e-5), key
+      assert (c > 0).all(), key
+
+  def test_invalid_steps_get_a_uniform_posterior(self):
+    _, _, feat = observe(make_dyn(), *make_batch(resets=(0, 3)))
+    c = np.asarray(feat['haw_type_prob'])
+    assert np.allclose(c[:, [0, 3]], 1.0 / TYPES, atol=1e-6)
+
+  def test_type_readout_is_not_zero_initialized(self):
+    """At exactly uniform logits the assignment entropy sits at a
+    zero-gradient saddle, so `typeout` must start with real weights."""
+    _, _, feat = observe(make_dyn(), *make_batch(resets=()))
+    assert np.asarray(feat['haw_type_prob'])[:, 1:].std() > 1e-6
+
+  def test_detector_input_layout(self):
+    """The type posterior reads this verbatim, so the layout is a contract."""
+    dyn = make_dyn()
+    action = jnp.asarray(
+        np.random.RandomState(0).normal(0, 1, (B, ACT)), f32)
+    delta = jnp.asarray(
+        np.random.RandomState(1).normal(0, 1, (B, OBS)), f32)
+    _, (inp, mag) = init_and_run(
+        lambda a, d: dyn._detector_input(a, d), action, delta)
+    assert inp.shape == (B, ACT + OBS + 1), inp.shape
+    assert np.allclose(np.asarray(inp)[:, :ACT], np.asarray(action))
+    assert np.allclose(np.asarray(inp)[:, -1], np.asarray(mag))
+
+  def test_types_never_enter_the_carry_or_replay(self):
+    dyn = make_dyn()
+    carry, _, _ = observe(dyn, *make_batch())
+    assert not any('type' in k for k in carry), sorted(carry)
+    assert not any('type' in k for k in dyn.entry_space), sorted(
+        dyn.entry_space)
+
+  def test_cluster_losses_train_only_the_classifier(self):
+    for key in ('event_conf', 'event_use'):
+      assert _grad_norms(lambda los, feat: los[key].mean(), _is_type) > 0.0, key
+      assert _grad_norms(
+          lambda los, feat: los[key].mean(), lambda k: not _is_type(k)) == 0.0, key
+
+  def test_type_prior_kl_trains_only_the_type_prior(self):
+    n = _grad_norms(
+        lambda los, feat: los['event_type_prior'].mean(), _is_tprior)
+    assert n > 0.0, n
+    assert _grad_norms(
+        lambda los, feat: los['event_type_prior'].mean(),
+        lambda k: not _is_tprior(k)) == 0.0
+
+  def test_typed_head_channel_trains_the_classifier(self):
+    """L_rew/con -> ct_st -> C_phi."""
+    n = _grad_norms(
+        lambda los, feat: _weighted(feat['haw_head_mix'][..., 1:]), _is_type)
+    assert n > 0.0, n
+
+  def test_typed_head_channel_does_not_reach_the_detector(self):
+    """sg(y) on the typed channel is what blocks the second route."""
+    n = _grad_norms(
+        lambda los, feat: _weighted(feat['haw_head_mix'][..., 1:]), _is_det)
+    assert n == 0.0, n
+
+  def test_binary_head_channel_still_trains_the_detector(self):
+    n = _grad_norms(
+        lambda los, feat: (1.0 - feat['haw_head_mix'][..., 0]).sum(), _is_det)
+    assert n > 0.0, n
+
+  def test_zero_event_mass_keeps_the_type_losses_finite(self):
+    losses, _, mets = run_loss(make_dyn(), resets=tuple(range(T)))
+    for key in ('event_conf', 'event_use', 'event_type_prior'):
+      assert np.isfinite(np.asarray(losses[key])).all(), key
+    assert np.allclose(np.asarray(losses['event_use']), 0.0)
+    assert np.isclose(
+        float(mets['event_type_effective_count']), TYPES, atol=1e-4)
+    assert np.isfinite(
+        np.asarray([float(v) for v in mets.values()], np.float32)).all()
+
+  def test_per_type_metrics_are_present_and_finite(self):
+    _, _, mets = run_loss(make_dyn(), resets=(0, 3))
+    keys = ['event_type_entropy_sample', 'event_type_entropy_usage',
+            'event_type_effective_count', 'event_type_max_occupancy',
+            'event_type_min_occupancy', 'event_type_prior_kl',
+            'event_type_prob_spread', 'event_type_prob_within_ratio']
+    keys += [f'event_type_usage_obs/{k}' for k in range(TYPES)]
+    keys += [f'event_type_prob_mean/{k}' for k in range(TYPES)]
+    keys += [f'event_type_detector_mag_mean/{k}' for k in range(TYPES)]
+    for key in keys:
+      assert key in mets, key
+      assert np.isfinite(float(mets[key])), (key, mets[key])

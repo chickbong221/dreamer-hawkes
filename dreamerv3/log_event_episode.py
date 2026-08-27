@@ -11,7 +11,9 @@ those cannot show is *where inside one episode* events fire, so that is all
 this module produces:
 
   event/probs           detector q_t against Hawkes p_t over the episode
-  event/spike_trace     binary strip of realized detector events
+  event/spike_trace     binary strip of realized events, colored by type
+  event/type_grid/<k>   event frames assigned to type k, across all eval
+                        envs and episodes
   event/episode_video   frames with a red border on spike steps
   event/hard_count      realized detector events in the episode
   event/expected_count  sum of q_t (still meaningful when the eval
@@ -20,6 +22,50 @@ this module produces:
 """
 
 import numpy as np
+
+# Distinguishable on both light and dark W&B themes; cycled if K is larger.
+_TYPE_COLORS = np.array([
+    [255, 60, 60], [70, 170, 255], [90, 220, 120], [250, 190, 60],
+    [200, 110, 255], [255, 140, 60], [60, 220, 220], [230, 230, 120],
+], np.uint8)
+
+
+def _grid(frames, ncols=8):
+  """Tile [N, H, W, 3] into one image, padding the last row."""
+  n, h, w = frames.shape[:3]
+  ncols = min(ncols, n)
+  nrows = int(np.ceil(n / ncols))
+  canvas = np.zeros((nrows * h, ncols * w, 3), np.uint8)
+  for i, frame in enumerate(frames):
+    r, c = divmod(i, ncols)
+    canvas[r * h:(r + 1) * h, c * w:(c + 1) * w] = frame
+  return canvas
+
+
+def _type_grids(wandb, cluster_samples, max_depth):
+  """One frame grid per assigned type, or nothing when a type is empty.
+
+  Frames were reservoir sampled at capture time, so the mean confidence in the
+  caption describes the type as a whole rather than its best examples.
+  """
+  panels = {}
+  if not cluster_samples:
+    return panels
+  for k in sorted(cluster_samples):
+    items = cluster_samples[k]
+    if not items:
+      continue
+    confs = np.asarray([c for c, _ in items], np.float32)
+    frames = np.stack([f for _, f in items], 0)
+    if frames.dtype == np.uint16 or frames.shape[-1] == 1:
+      frames = np.stack([_depth_to_rgb(f, max_depth) for f in frames], 0)
+    else:
+      frames = _rgb_to_frames(frames)
+    panels[f'event/type_grid/{k}'] = wandb.Image(
+        _grid(frames),
+        caption=(f'type {k}: {len(items)} shown, '
+                 f'mean confidence {confs.mean():.2f}'))
+  return panels
 
 
 def _upscale(image, target_h, target_w):
@@ -68,7 +114,8 @@ def _episode_frames(data, T, max_depth):
   return None
 
 
-def build_event_episode_payload(agent, data, max_depth=None):
+def build_event_episode_payload(
+    agent, data, max_depth=None, cluster_samples=None):
   """Build binary-event panels from an episode captured by the eval loop.
 
   Args:
@@ -77,6 +124,8 @@ def build_event_episode_payload(agent, data, max_depth=None):
       are haw_prob, haw_event and haw_prior_prob. Depth frames are
       optional.
     max_depth: depth maximum in millimeters for uint16 visualization.
+    cluster_samples: optional {type: [(confidence, frame)]} collected
+      across every evaluation env and episode, for the per-type grids.
 
   Returns:
     A dict of W&B media objects ready to merge into the eval-step payload.
@@ -121,13 +170,22 @@ def build_event_episode_payload(agent, data, max_depth=None):
       keys=['detector_q', 'hawkes_p'],
       title='Event probability over the episode', xname='t')
 
-  # Binary strip: red where the detector fired, dark otherwise.
+  # Binary strip, colored by assigned type where an event fired. Cluster
+  # ids are arbitrary and permute across runs: read the grouping, not the
+  # hue.
   strip = np.zeros((1, T, 3), np.uint8)
-  strip[0, spikes] = np.array([255, 60, 60], np.uint8)
-  strip[0, ~spikes] = np.array([30, 30, 40], np.uint8)
+  strip[0] = np.array([30, 30, 40], np.uint8)
+  types = data.get('haw_type_prob')
+  if types is not None and len(types):
+    kind = np.asarray(types, np.float32).reshape(T, -1).argmax(-1)
+    strip[0, spikes] = _TYPE_COLORS[kind[spikes] % len(_TYPE_COLORS)]
+  else:
+    strip[0, spikes] = np.array([255, 60, 60], np.uint8)
   payload['event/spike_trace'] = wandb.Image(
       _upscale(strip, 24, T * 6),
-      caption=f'{int(spikes.sum())} events in {T} steps')
+      caption=f'{int(spikes.sum())} events in {T} steps, colored by type')
+
+  payload.update(_type_grids(wandb, cluster_samples, max_depth))
 
   # Episode video with an event bar above the frame: dark grey normally, red
   # on the steps where an event fired.

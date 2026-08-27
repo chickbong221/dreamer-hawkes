@@ -109,15 +109,15 @@ defaults:
     coordinator_address: ''
 
   agent:
-    # haw and event_rate are produced only by HawkesRSSM; Agent drops them
-    # from the scales when dyn.typ == rssm.
-    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, haw: 1.0, event_rate: 1.0}
+    # haw, event_rate and the three event_* type scales are produced only
+    # by HawkesRSSM; Agent drops them when dyn.typ == rssm.
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3, haw: 1.0, event_rate: 1.0, event_conf: 0.1, event_use: 0.1, event_type_prior: 1.0}
     opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
     ac_grads: False
     dyn:
       typ: rssm
       rssm:   {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
-      hawkes: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0, haw_hidden: 256, haw_embed: 32, haw_context_hidden: 256, haw_target_rate: 0.05, haw_rate_clip: 0.001, haw_eval_threshold: 0.5, haw_init_alpha: 0.1, haw_init_beta: 1.0, haw_detector_outscale: 0.1}
+      hawkes: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0, haw_hidden: 256, haw_embed: 32, haw_context_hidden: 256, haw_target_rate: 0.05, haw_rate_clip: 0.001, haw_eval_threshold: 0.5, haw_init_alpha: 0.1, haw_init_beta: 1.0, haw_detector_outscale: 0.1, haw_types: 4, haw_type_temp: 1.0}
     enc:
       typ: simple
       simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
@@ -392,3 +392,8 @@ hawkes:
       typ: hawkes
   run:
     eval_event_log: True
+    # Wide eval so the per-type frame grids have enough members to judge: at
+    # rho=0.05 over ~100-step episodes this yields ~100 events, ~25 per type
+    # at K=4. Parallel envs rather than sequential episodes for the same
+    # sample size at lower wall-clock cost.
+    eval_envs: 20

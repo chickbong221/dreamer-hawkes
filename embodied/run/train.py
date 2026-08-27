@@ -61,6 +61,34 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
       'values': collections.defaultdict(list),
   }
 
+  cluster_rng = np.random.RandomState(0)
+
+  def _collect_cluster_frames(store, seen, outs, obs, cap=32):
+    """Reservoir-sample up to `cap` event frames per assigned type.
+
+    Uniform among that type's frames on purpose: picking the most
+    confident ones would make every partition look clean and would make
+    the mean-confidence caption meaningless.
+    """
+    if store is None or seen is None or 'haw_type_prob' not in outs:
+      return
+    key = next((k for k in ('image', 'depth_head') if k in obs), None)
+    if key is None:
+      return
+    fired = _to_numpy(outs['haw_event']).reshape(-1) > 0.5
+    types = _to_numpy(outs['haw_type_prob'])
+    frames = _to_numpy(obs[key])
+    for b in np.nonzero(fired)[0]:
+      k = int(types[b].argmax())
+      item = (float(types[b].max()), frames[b].copy())
+      seen[k] += 1
+      if len(store[k]) < cap:
+        store[k].append(item)
+      else:
+        j = cluster_rng.randint(seen[k])
+        if j < cap:
+          store[k][j] = item
+
   def _to_numpy(value):
     try:
       import torch
@@ -261,6 +289,12 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
     # Filled only from episode 0, environment index 0. This reuses the
     # existing evaluation rollout and never creates an event-specific env.
     event_data = collections.defaultdict(list) if eval_event_log else None
+    # Reservoir store and its counter are recreated together: a stale
+    # count against a fresh store would bias every later phase toward the
+    # frames it happened to see first.
+    cluster_samples = (
+        collections.defaultdict(list) if eval_event_log else None)
+    cluster_seen = collections.Counter() if eval_event_log else None
 
     for eval_episode_idx in range(eval_episodes_per_env):
       carry = agent.init_policy(eval_num_envs)
@@ -311,13 +345,21 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
         assert all(k not in acts for k in outs), (
             list(outs.keys()), list(acts.keys()))
 
-        if event_data is not None and eval_episode_idx == 0 and \
-           'haw_prob' in outs:
-          for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
-            event_data[key].append(float(_to_numpy(outs[key])[0]))
-          for key in ('image', 'depth_head', 'depth_hand'):
-            if key in obs:
-              event_data[key].append(_to_numpy(obs[key][0]).copy())
+        if event_data is not None and 'haw_prob' in outs:
+          # Trace buffer: the contiguous timestep sequence for env 0 of the
+          # first episode, for the probability curves, the strip and the video.
+          if eval_episode_idx == 0:
+            for key in ('haw_prob', 'haw_event', 'haw_prior_prob'):
+              event_data[key].append(float(_to_numpy(outs[key])[0]))
+            # Vector valued: the type posterior is [K], not a scalar.
+            event_data['haw_type_prob'].append(
+                _to_numpy(outs['haw_type_prob'])[0].copy())
+            for key in ('image', 'depth_head', 'depth_hand'):
+              if key in obs:
+                event_data[key].append(_to_numpy(obs[key][0]).copy())
+          # Cluster buffer: event frames from every env and every episode.
+          _collect_cluster_frames(
+              cluster_samples, cluster_seen, outs, obs)
 
         if done.any():
           mask = ~done
@@ -350,7 +392,8 @@ def train(make_agent, make_replay, make_env, make_stream, make_logger, args):
                     for key, values in event_data.items()}
         max_depth = float(getattr(eval_env, '_max_depth', 20000.0))
         eval_payload.update(build_event_episode_payload(
-            agent, captured, max_depth=max_depth))
+            agent, captured, max_depth=max_depth,
+            cluster_samples=cluster_samples))
       except Exception as exc:
         import traceback
         print(f'[event-episode] eval logging failed: {exc!r}')

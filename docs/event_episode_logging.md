@@ -23,6 +23,14 @@ across the whole run:
 `haw_base`, `haw_alpha`, `haw_beta`, `haw_valid_frac`,
 `haw_lam_fit_err`.
 
+Event types add `event_type_entropy_sample`, `event_type_entropy_usage`,
+`event_type_effective_count`, `event_type_max_occupancy`,
+`event_type_min_occupancy`, `event_type_prior_kl`,
+`event_type_prob_spread`, `event_type_prob_within_ratio`,
+`event_type_usage_obs/<k>`, `event_type_usage_img/<k>`,
+`event_type_prob_mean/<k>`, `event_type_detector_mag_mean/<k>`,
+`event_type_reward_spread` and `event_type_cont_spread`.
+
 Three more appear only in `report()` (`training=False`), because the
 deployment probe costs a second context-network evaluation:
 `haw_gap_teacher`, `haw_gap_deploy`, `haw_gap_memory`,
@@ -37,7 +45,8 @@ training metric is deliberately not logged here.
 | W&B key | Type | Content |
 |---|---|---|
 | `event/probs` | Line | detector `q_t` against Hawkes `p_t` |
-| `event/spike_trace` | Image | `[1 x T]` strip, red where the detector fired |
+| `event/spike_trace` | Image | `[1 x T]` strip, colored by assigned type where the detector fired |
+| `event/type_grid/<k>` | Image | event frames assigned to type `k`, pooled across every eval env and episode |
 | `event/episode_video` | Video | mp4 of the episode with a bar above the frame, red on spike steps |
 | `event/hard_count` | Scalar | events in the episode |
 | `event/expected_count` | Scalar | `sum(q_t)` |
@@ -55,8 +64,8 @@ other four panels still appear.
 
 ## Capture path
 
-`Agent.policy()` surfaces `haw_prob`, `haw_event` and `haw_prior_prob` in
-`outs`, but only when `mode == 'eval'`. That gating matters: under
+`Agent.policy()` surfaces `haw_prob`, `haw_event`, `haw_prior_prob` and
+`haw_type_prob` in `outs`, but only when `mode == 'eval'`. That gating matters: under
 `mode='train'` the driver merges `outs` into the transitions written to
 replay, and `agent.train()` asserts the per-batch keys equal `self.spaces`
 exactly, so extra fields there would break training. `mode` is a
@@ -89,12 +98,16 @@ Disable with `--run.eval_event_log False`.
 
 ## Reading the panels
 
-`event/spike_trace` will be **empty** whenever `pi_t` stays below
-`haw_eval_threshold` (default `0.5`). That is expected while the event model sits
-near the target rate `rho` (default `0.05`): eval thresholds deterministically
-while training samples. Read `event/probs` and `event/expected_count` for the
-event model's actual behavior, and lower `haw_eval_threshold` if you want visible
-spikes.
+Evaluation samples events exactly like training and imagination
+(`_dyn_policy_kw` ignores `mode`), so `event/hard_count` should track
+`event/expected_count` at roughly `rho * T`. `haw_eval_threshold` survives only
+as an explicit diagnostic through `sample_event=False`; it is not used in
+normal evaluation.
+
+Cluster ids are permutation-dependent — they carry no meaning across runs or
+even across restarts. Read the grouping in `event/type_grid/<k>`, never the
+index. Frames in those grids are reservoir sampled among each type's events, so
+the mean-confidence caption describes the type rather than its best examples.
 
 Other things worth watching:
 
@@ -113,6 +126,19 @@ Other things worth watching:
 - **`haw_lam_fit_err` above ~1e-4** means the detached fitting recurrence no
   longer reproduces the live one — a misalignment in the reset mask, the event
   indexing, or the initial carry. See `TestFittingInvariant`.
+- **`event_type_effective_count` near 1** is single-cluster collapse. Near `K`
+  with indistinguishable grids is the opposite failure: `event_use` splitting
+  identical events to fill the budget.
+- **`event_type_prob_within_ratio` near 0** means the classifier is simply
+  binning the detector probability — all the variation in `q` sits between
+  clusters and none within them. Read it with `event_type_prob_spread`; a
+  large spread alone is suggestive, the two together are decisive.
+- **`event_type_reward_spread` and `event_type_cont_spread` near zero** mean
+  the reward and continuation heads are reading the binary event and ignoring
+  which type it was, so nothing is giving the classifier semantics.
+- **`event_type_usage_img/<k>` far from `event_type_usage_obs/<k>`** means the
+  type prior cannot reproduce the posterior from prior-only inputs; check
+  `event_type_prior_kl`.
 
 ## Dependencies
 
