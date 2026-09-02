@@ -7,7 +7,7 @@ class TestPolicyKwargs:
 
   def test_eval_samples_events_like_training(self):
     """Regression guard: evaluation must not fall back to the 0.5 threshold,
-    or no event ever fires at rho ~ 0.05 and the event panels stay empty."""
+    or no event ever fires at a sparse rho and the event panels stay empty."""
     train = _dyn_policy_kw(True, 'train')
     eval_ = _dyn_policy_kw(True, 'eval')
     assert train == eval_, (train, eval_)

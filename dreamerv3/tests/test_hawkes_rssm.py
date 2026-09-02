@@ -153,6 +153,16 @@ class TestShapesAndMasking:
     assert q.std() > 1e-4, q.std()
     assert (q > 0).all() and (q < 1).all()
 
+  def test_detector_starts_near_the_configured_rho(self):
+    """binit=logit(rho) has to survive the wider input: q must still be
+    centred on the budget after sg(h_t) joined xi_t."""
+    for rho in (0.03, 0.1, 0.3):
+      dyn = make_dyn(haw_target_rate=rho)
+      _, _, feat = observe(dyn, *make_batch(resets=()))
+      q = np.asarray(feat['haw_prob'])[:, 1:]
+      assert abs(q.mean() - rho) < max(0.02, 0.5 * rho), (rho, q.mean())
+      assert q.std() > 1e-4, (rho, q.std())
+
   def test_hawkes_prior_starts_exactly_at_rho(self):
     """b is set so 1 - exp(-softplus(b)) == rho, and ctxout starts at zero."""
     _, _, feat = observe(make_dyn(), *make_batch(resets=()))
@@ -738,17 +748,56 @@ class TestEventTypes:
     assert np.asarray(feat['haw_type_prob'])[:, 1:].std() > 1e-6
 
   def test_detector_input_layout(self):
-    """The type posterior reads this verbatim, so the layout is a contract."""
+    """The type posterior reads this verbatim, so the layout is a contract:
+    [a_{t-1}, sg(h_t), symlog(sg(dx_t)), log1p(RMS(sg(dx_t)))]."""
     dyn = make_dyn()
     action = jnp.asarray(
         np.random.RandomState(0).normal(0, 1, (B, ACT)), f32)
+    deter = jnp.asarray(
+        np.random.RandomState(2).normal(0, 1, (B, DETER)), f32)
     delta = jnp.asarray(
         np.random.RandomState(1).normal(0, 1, (B, OBS)), f32)
     _, (inp, mag) = init_and_run(
-        lambda a, d: dyn._detector_input(a, d), action, delta)
-    assert inp.shape == (B, ACT + OBS + 1), inp.shape
+        lambda a, h, d: dyn._detector_input(a, h, d), action, deter, delta)
+    assert inp.shape == (B, ACT + DETER + OBS + 1), inp.shape
     assert np.allclose(np.asarray(inp)[:, :ACT], np.asarray(action))
+    assert np.allclose(
+        np.asarray(inp)[:, ACT:ACT + DETER], np.asarray(deter))
+    assert np.allclose(
+        np.asarray(inp)[:, ACT + DETER:-1],
+        np.asarray(nn.symlog(delta)), atol=1e-6)
     assert np.allclose(np.asarray(inp)[:, -1], np.asarray(mag))
+
+  def test_detector_reads_the_recurrent_history(self):
+    """q_t must move when h_t moves: the whole point of feeding sg(h_t) is
+    that "the gripper moved" and "the gripper closed on the tool" are the
+    same pixels under a different task history."""
+    dyn = make_dyn()
+    action = jnp.zeros((B, ACT), f32)
+    delta = jnp.asarray(
+        np.random.RandomState(1).normal(0, 1, (B, OBS)), f32)
+    rng = np.random.RandomState(3)
+    h1 = jnp.asarray(rng.normal(0, 1, (B, DETER)), f32)
+    h2 = jnp.asarray(rng.normal(0, 1, (B, DETER)), f32)
+
+    def fn(a, h, d):
+      inp, _ = dyn._detector_input(a, h, d)
+      return dyn._detector(inp)
+
+    params = nj.init(fn)({}, action, h1, delta, seed=0)
+    q1 = nj.pure(fn)(params, action, h1, delta, seed=0)[1]
+    q2 = nj.pure(fn)(params, action, h2, delta, seed=0)[1]
+    assert np.abs(np.asarray(q1) - np.asarray(q2)).max() > 1e-4, (q1, q2)
+
+  def test_detector_does_not_reshape_the_rssm(self):
+    """sg(h_t) on the detector input: the rate budget must not be able to
+    make its own target easier by moving the recurrence."""
+    n = _grad_norms(lambda los, feat: los['event_rate'].mean(), _is_rssm)
+    assert n == 0.0, n
+
+  def test_detector_input_gradient_reaches_only_the_detector(self):
+    n = _grad_norms(lambda los, feat: los['event_rate'].mean(), _is_det)
+    assert n > 0.0, n
 
   def test_types_never_enter_the_carry_or_replay(self):
     dyn = make_dyn()
@@ -805,6 +854,24 @@ class TestEventTypes:
         float(mets['event_type_effective_count']), TYPES, atol=1e-4)
     assert np.isfinite(
         np.asarray([float(v) for v in mets.values()], np.float32)).all()
+
+  def test_future_head_feature_inherits_the_head_routing(self):
+    """`Agent._futurefeat` reads the same two channels out of
+    `haw_head_mix` that `_headfeat` does, so the auxiliary future-reward
+    head inherits the routing verbatim: y_t to the detector, sg(y_t) c^ST
+    to the classifier, and nothing to the RSSM through the detached z_t."""
+    from dreamerv3.agent import Agent
+    consume = lambda los, feat: _weighted(Agent._futurefeat(None, feat))
+    assert _grad_norms(consume, _is_det) > 0.0
+    assert _grad_norms(consume, _is_type) > 0.0
+    assert _grad_norms(consume, _is_rssm) == 0.0
+
+  def test_future_head_typed_channel_cannot_reach_the_detector(self):
+    from dreamerv3.agent import Agent
+    typed = lambda los, feat: _weighted(
+        Agent._futurefeat(None, feat)[..., -TYPES:])
+    assert _grad_norms(typed, _is_type) > 0.0
+    assert _grad_norms(typed, _is_det) == 0.0
 
   def test_per_type_metrics_are_present_and_finite(self):
     _, _, mets = run_loss(make_dyn(), resets=(0, 3))

@@ -55,6 +55,7 @@ class Agent(embodied.jax.Agent):
     self.obs_space = obs_space
     self.act_space = act_space
     self.config = config
+    self.hawkes = config.dyn.typ == 'hawkes'
 
     exclude = ('is_first', 'is_last', 'is_terminal', 'reward')
     enc_space = {k: v for k, v in obs_space.items() if k not in exclude}
@@ -85,6 +86,13 @@ class Agent(embodied.jax.Agent):
     binary = elements.Space(bool, (), 0, 2)
     self.rew = embodied.jax.MLPHead(scalar, **config.rewhead, name='rew')
     self.con = embodied.jax.MLPHead(binary, **config.conhead, name='con')
+    # Auxiliary long-horizon reward head. An ordinary MLP -- no Hawkes
+    # process, no recurrence, no intensity, no memory, and it never sees
+    # p_t, M_t or lam_t. It exists only under dyn.typ == hawkes because its
+    # inputs (y_t and sg(y_t) c^ST_t) exist only there. Same output
+    # distribution as `rew`, separate parameters.
+    self.future_rew = embodied.jax.MLPHead(
+        scalar, **config.rewhead, name='future_rew') if self.hawkes else None
 
     d1, d2 = config.policy_dist_disc, config.policy_dist_cont
     outs = {k: d1 if v.discrete else d2 for k, v in act_space.items()}
@@ -102,17 +110,18 @@ class Agent(embodied.jax.Agent):
 
     self.modules = [
         self.dyn, self.enc, self.dec, self.rew, self.con, self.pol, self.val]
+    if self.hawkes:
+      self.modules.append(self.future_rew)
     self.opt = embodied.jax.Optimizer(
         self.modules, self._make_opt(**config.opt), summary_depth=1,
         name='opt')
 
-    self.hawkes = config.dyn.typ == 'hawkes'
     scales = self.config.loss_scales.copy()
     rec = scales.pop('rec')
     scales.update({k: rec for k in dec_space})
     if not self.hawkes:
       for key in ('haw', 'event_rate', 'event_conf', 'event_use',
-                  'event_type_prior'):
+                  'event_type_prior', 'event_future_rew'):
         scales.pop(key, None)
     self.scales = scales
 
@@ -219,7 +228,11 @@ class Agent(embodied.jax.Agent):
     con = f32(~obs['is_terminal'])
     if self.config.contdisc:
       con *= 1 - 1 / self.config.horizon
-    losses['con'] = self.con(self._headfeat(repfeat), 2).loss(con)
+    # Plain [h, z]: ManiSkill never signals task termination, so the target
+    # is effectively constant and any event input to this head would shape
+    # event placement and typing against a signal that carries nothing.
+    # Continuation still trains the ordinary RSSM features.
+    losses['con'] = self.con(self.feat2tensor(repfeat), 2).loss(con)
     for key, recon in recons.items():
       space, value = self.obs_space[key], obs[key]
       assert value.dtype == space.dtype, (key, space, value.dtype)
@@ -230,6 +243,11 @@ class Agent(embodied.jax.Agent):
       else:
         target = value
       losses[key] = recon.loss(sg(target))
+
+    if self.hawkes:
+      los, mets = self._future_loss(repfeat, obs)
+      losses['event_future_rew'] = los
+      metrics.update(mets)
 
     B, T = reset.shape
     shapes = {k: v.shape for k, v in losses.items()}
@@ -266,13 +284,13 @@ class Agent(embodied.jax.Agent):
     inp = self.feat2tensor(imgfeat)
     rewmix, rewspread = self._headmix(
         self.rew, imgfeat, lambda o: o.pred(), spread=True)
-    conmix, conspread = self._headmix(
-        self.con, imgfeat, lambda o: o.prob(1), spread=True)
+    # No marginalization here: the continuation head reads [h, z] only, so
+    # there is nothing to marginalize over.
+    conmix = self.con(inp, 2).prob(1)
     if self.hawkes:
-      # Near zero means the heads are reading the binary event and ignoring
-      # which type it was.
+      # Near zero means the reward head is reading the binary event and
+      # ignoring which type it was.
       metrics['event_type_reward_spread'] = rewspread
-      metrics['event_type_cont_spread'] = conspread
     los, imgloss_out, mets = imag_loss(
         imgact,
         rewmix,
@@ -331,6 +349,86 @@ class Agent(embodied.jax.Agent):
     mix = nn.cast(feat['haw_head_mix'])
     return jnp.concatenate([x, 1.0 - mix[..., :1], mix[..., 1:]], -1)
 
+  def _futurefeat(self, feat):
+    """[sg(z_t), y_t, sg(y_t) c^ST_t] -- the auxiliary head's input.
+
+    No h_t and a detached z_t: this head must not be able to reshape the RSSM
+    to make a long-horizon target easier to hit. What it does reach is the
+    event itself, which is the point:
+
+      L_future -> y_t          -> D_psi   (binary, straight through)
+      L_future -> sg(y_t) c^ST -> C_phi   (type, only on frames that fired)
+
+    Both channels are read back out of `haw_head_mix` exactly as `_headfeat`
+    reads them, so the two heads see the same event encoding.
+    """
+    z = nn.cast(sg(feat['stoch'].reshape((*feat['stoch'].shape[:-2], -1))))
+    mix = nn.cast(feat['haw_head_mix'])
+    return jnp.concatenate([z, 1.0 - mix[..., :1], mix[..., 1:]], -1)
+
+  def _future_loss(self, repfeat, obs):
+    """Auxiliary H-step future-return regression, plus its probes.
+
+    Supervised only on frames with a complete, reset-free horizon, and
+    normalized by that count, so the loss does not shrink when a batch
+    happens to hold fewer of them. Returns a [B, T] broadcast of the scalar
+    so it drops into `losses` like every other term.
+
+    Report-only, never fed back: this prediction is not added to the imagined
+    reward, not shown to actor or critic, not an intrinsic reward, not part
+    of any value target, and it does not touch the Hawkes memory.
+    """
+    H = int(self.config.event_future_horizon)
+    disc = 1 - 1 / self.config.horizon
+    target, umask = future_return_target(
+        obs['reward'], obs['is_first'], H, disc)
+    out = self.future_rew(self._futurefeat(repfeat), 2)
+    total = umask.sum()
+    denom = jnp.maximum(total, 1.0)
+    # A batch with no full-horizon frame takes the constant branch, so the
+    # loss is an exact zero with an exact zero gradient, not 0/eps.
+    value = jnp.where(
+        total > 0, (umask * out.loss(sg(target))).sum() / denom, 0.0)
+    metrics = {
+        'event_future_loss': value,
+        'event_future_target_mean': (umask * target).sum() / denom,
+        'event_future_pred_mean': (umask * f32(out.pred())).sum() / denom,
+        'event_future_full_horizon_frac': umask.mean()}
+    metrics.update(self._future_probes(repfeat))
+    return jnp.broadcast_to(value, umask.shape), metrics
+
+  def _future_probes(self, repfeat):
+    """Does the auxiliary head read the event, and does it read the type.
+
+    S_y = E|F(z, 1, c) - F(z, 0, 0)| over frames that fired, and
+    S_c = E[max_k F(z, 1, e_k) - min_k F(z, 1, e_k)] over valid frames.
+    Both fall out of the same K + 1 evaluations, because `haw_head_mix`
+    channels 1: are exactly onehot(c_t) wherever y_t = 1. Detached: a metric
+    must not open a gradient route.
+    """
+    z = nn.cast(sg(repfeat['stoch'].reshape(
+        (*repfeat['stoch'].shape[:-2], -1))))
+    mix = f32(sg(repfeat['haw_head_mix']))
+    K = mix.shape[-1] - 1
+    zeros = jnp.zeros((*z.shape[:-1], 1 + K), z.dtype)
+    at = lambda chan: f32(
+        self.future_rew(jnp.concatenate([z, chan], -1), 2).pred())
+    noevent = at(zeros)
+    typed = jnp.stack(
+        [at(zeros.at[..., 0].set(1).at[..., 1 + k].set(1)) for k in range(K)],
+        -1)
+    fired = 1.0 - mix[..., 0]
+    valid = f32(repfeat['haw_valid'])
+    sel = (mix[..., 1:] * typed).sum(-1)
+    return {
+        'event_future_sens_binary': (
+            (fired * jnp.abs(sel - noevent)).sum() /
+            jnp.maximum(fired.sum(), 1.0)),
+        'event_future_sens_type': (
+            (valid * (typed.max(-1) - typed.min(-1))).sum() /
+            jnp.maximum(valid.sum(), 1.0)),
+    }
+
   def _headmix(self, head, feat, readout, spread=False):
     """E[readout(head)] over the K + 1 event outcomes.
 
@@ -343,6 +441,9 @@ class Agent(embodied.jax.Agent):
 
     Unrolled rather than folded into one batched call: the K + 1 copies of
     `base` would be the largest activation in the imagination path.
+
+    Only the reward head uses this. The continuation head reads [h, z], so
+    there is no event to marginalize out of it.
     """
     if not self.hawkes:
       out = readout(head(self.feat2tensor(feat), 2))
@@ -524,6 +625,38 @@ class Agent(embodied.jax.Agent):
       sched = optax.join_schedules([ramp, sched], [warmup])
     chain.append(optax.scale_by_learning_rate(sched))
     return optax.chain(*chain)
+
+
+def future_return_target(rew, first, horizon, disc):
+  """Discount-normalized H-step future return and its full-horizon mask.
+
+    G_t = sum_{k=1..H} disc^(k-1) r_{t+k} / sum_{k=1..H} disc^(k-1)
+    u_t = 1[t + H < T] * prod_{j=1..H} (1 - is_first_{t+j})
+
+  Strict on purpose. A frame is supervised only when all H of its future
+  rewards are present in this replay sequence and none of them belongs to a
+  later episode. The horizon is never shortened at the tail, missing rewards
+  are never zero filled, and `is_terminal` plays no part in availability --
+  a truncated window is a different, easier target that would drift with the
+  batch length. The sum starts at r_{t+1}, not r_t.
+  """
+  assert horizon >= 1, horizon
+  rew, first = f32(rew), f32(first)
+  B, T = rew.shape
+  H = int(horizon)
+  if H >= T:
+    zeros = jnp.zeros((B, T), f32)
+    return zeros, zeros
+  w = np.asarray([disc ** k for k in range(H)], np.float32)
+  num = jnp.zeros((B, T - H), f32)
+  alive = jnp.ones((B, T - H), f32)
+  for k in range(1, H + 1):
+    num += w[k - 1] * rew[:, k: T - H + k]
+    alive *= 1.0 - first[:, k: T - H + k]
+  pad = jnp.zeros((B, H), f32)
+  return (
+      jnp.concatenate([num / w.sum(), pad], 1),
+      jnp.concatenate([alive, pad], 1))
 
 
 def imag_loss(

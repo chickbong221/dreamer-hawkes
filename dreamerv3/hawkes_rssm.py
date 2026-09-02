@@ -5,14 +5,16 @@ events from what actually happened; a Hawkes binary prior p_t placed after the
 world-model update, which is what imagination deploys; and an event-type pair
 (posterior c^+ from the observation, prior c^- for imagination).
 
-Both the binary event and its type reach the reward and continuation heads,
-but only the binary event reaches the RSSM recurrence, and their gradients
-stay on separate routes:
+Both the binary event and its type reach the reward head and the auxiliary
+future-reward head in agent.py, but only the binary event reaches the RSSM
+recurrence, and their gradients stay on separate routes:
 
-  L_rew/con -> y_t      -> q_t -> D_psi        (binary route)
-  L_rew/con -> ct_st    -> C_phi               (type route)
-  L_rew/con -> C_phi  -X-> D_psi               (blocked by sg(y_t) on the
+  L_rew/fut -> y_t      -> q_t -> D_psi        (binary route)
+  L_rew/fut -> ct_st    -> C_phi               (type route)
+  L_rew/fut -> C_phi  -X-> D_psi               (blocked by sg(y_t) on the
                                                 typed channel)
+
+The continuation head is deliberately not on this list: it reads [h, z] only.
 
   e^H_{t-1} = omega(M_{t-1}, log1p(lam_{t-1}))
   h_t       = core(h_{t-1}, z_{t-1}, a_{t-1}, e^H_{t-1})
@@ -24,7 +26,7 @@ stay on separate routes:
   Mbar_t    = exp(-beta) M_{t-1}
   lam_t     = softplus(b + Mbar_t + g_eta(sg(h_t), symlog(d_t), m_t))
   p_t       = 1 - exp(-lam_t)                     the Hawkes prediction
-  xi_t      = [a_{t-1}, symlog(sg(dx_t)), m^x_t]                 detector input
+  xi_t      = [a_{t-1}, sg(h_t), symlog(sg(dx_t)), m^x_t]        detector input
   q_t       = sigmoid(D_psi(xi_t))                the detector
   y_t       = straight-through Bernoulli(q_t) observing, Bernoulli(p_t) imagining
   c^+_t     = softmax(C_phi([sg(xi_t), sg(q_t)]) / tau)          type posterior
@@ -46,8 +48,9 @@ sample, only on how the distribution moved.
 
 `haw_head_mix` [..., 1 + K] carries the head routing: [1 - y, sg(y) ct_st]
 when observing, one-hot on the realized outcome; [1 - p, p c^-] when
-imagining, the true joint over the K + 1 outcomes. `_headfeat` reads y and
-y*c back out of it; `_headmix` uses it as marginalization weights.
+imagining, the true joint over the K + 1 outcomes. `_headfeat` and
+`_futurefeat` read y and y*c back out of it; `_headmix` uses it as
+marginalization weights for the reward head under imagination.
 
 Two masks, kept logically separate:
   keep  = ~reset                    masks the incoming h, z, M, lam.
@@ -57,13 +60,16 @@ Two masks, kept logically separate:
                                     previous encoder token -- but the restored
                                     Hawkes state is still used, not cleared.
 
-Losses: Dreamer's reward/cont heads and the delayed y_t -> M_t -> h_{t+1} path
-decide where events fire; `event_rate` is a two-sided KL budget on mean(q);
-`haw` fits b/alpha/beta/g_eta to detached detector statistics through an
-explicit recurrence, and has zero gradient into the detector or the RSSM.
-`event_conf` and `event_use` cluster the type posterior and reach only C_phi,
-since its inputs are detached. `event_type_prior` fits P_theta to a detached
-c^+ and reaches only P_theta.
+Losses: Dreamer's reward head, the auxiliary future-reward head and the
+delayed y_t -> M_t -> h_{t+1} path decide where events fire; `event_rate` is a
+two-sided KL budget on mean(q); `haw` fits b/alpha/beta/g_eta to detached
+detector statistics through an explicit recurrence, and has zero gradient into
+the detector or the RSSM. `event_conf` and `event_use` cluster the type
+posterior and reach only C_phi, since its inputs are detached -- both ship at
+scale 0, so types have to earn their existence through reward prediction
+rather than being forced into a balanced, confident partition; the terms and
+their metrics stay computed for the ablation. `event_type_prior` fits P_theta
+to a detached c^+ and reaches only P_theta.
 
 Hawkes scalars and the latent log-probs are float32 -- the recurrence
 accumulates, and differencing log-probs near log(u/C) underflows bfloat16.
@@ -132,7 +138,7 @@ class HawkesRSSM(nj.Module):
   haw_hidden: int = 256
   haw_embed: int = 32
   haw_context_hidden: int = 256
-  haw_target_rate: float = 0.05       # rho
+  haw_target_rate: float = 0.03       # rho
   haw_rate_clip: float = 1e-3
   haw_eval_threshold: float = 0.5
   haw_init_alpha: float = 0.1
@@ -275,17 +281,26 @@ class HawkesRSSM(nj.Module):
     _, alpha, _ = self._haw_params()
     return mbar + alpha * event
 
-  def _detector_input(self, action, delta):
-    """xi_t and its unsquashed scale channel; the delta is detached here.
+  def _detector_input(self, action, deter, delta):
+    """xi_t = [a_{t-1}, sg(h_t), symlog(sg(dx_t)), log1p(RMS(sg(dx_t)))].
+
+    Layout is a contract: the type posterior reads sg(xi_t) verbatim, and the
+    width assertions in the tests pin the field order.
+
+    h_t is detached. The detector needs task history to tell "the gripper
+    moved" from "the gripper closed on the tool", but the rate budget must not
+    be able to reshape the RSSM to make its own target easier -- the same
+    reason `_context` and `_type_prior` detach their inputs.
 
     symlog keeps the delta scale-preserving (an RMS norm would erase the
     magnitude that distinguishes an event); `mag` restores one raw scale
-    channel. Shared verbatim with the type posterior, which reads sg(xi_t).
+    channel. Both forms of the visual delta are detached.
     """
     delta = sg(f32(delta))
     mag = jnp.log1p(jnp.sqrt(jnp.square(delta).mean(-1) + 1e-8))
     inp = jnp.concatenate([
         nn.cast(action),
+        nn.cast(sg(deter)),
         nn.cast(nn.symlog(delta)),
         nn.cast(mag)[..., None]], -1)
     return inp, f32(mag)
@@ -422,7 +437,7 @@ class HawkesRSSM(nj.Module):
 
     # Detector sees o_t but only reaches h_{t+1}.
     dx = nn.mask(tokens_flat - carry['haw_prev_obs'], valid)
-    det_in, obs_mag = self._detector_input(action, dx)
+    det_in, obs_mag = self._detector_input(action, deter, dx)
     prob = jnp.where(valid, self._detector(det_in), 0.0)
     if sample_event:
       draw = f32(jax.random.bernoulli(nj.seed(), prob))
