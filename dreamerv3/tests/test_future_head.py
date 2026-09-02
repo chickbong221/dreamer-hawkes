@@ -87,6 +87,31 @@ def make_data(seed=0, resets=(0,)):
 _CACHE = {}
 
 
+def wake(params, *prefixes, seed=0):
+  """Give the zero-initialized head output kernels real weights.
+
+  `rewhead.outscale` is 0.0, which both reward heads inherit, so at init the
+  output layer's kernel is exactly zero and dL/dinput = W^T dL/dlogits = 0:
+  *no* gradient reaches the head's input, event channels included. Every
+  routing test through one of these heads would then read zero and pass for
+  entirely the wrong reason, and every per-frame loss would be the uniform
+  log(bins). One optimizer step fixes this in a real run; here it has to be
+  done by hand, the way `wake_ctx` does it for g_eta in test_hawkes_rssm.py.
+  """
+  rng = np.random.RandomState(seed)
+  out = dict(params)
+  woke = []
+  for key, value in out.items():
+    if not key.startswith(prefixes) or not key.endswith('kernel'):
+      continue
+    if float(jnp.abs(value).max()) > 0.0:
+      continue
+    out[key] = jnp.asarray(rng.normal(0, 0.1, value.shape), value.dtype)
+    woke.append(key)
+  assert woke, (prefixes, 'nothing was zero initialized')
+  return out
+
+
 def state():
   """Model, initialized params and one batch, built once for the whole file."""
   if 'state' not in _CACHE:
@@ -98,6 +123,7 @@ def state():
       return model.loss(carry, obs, prevact, training=True)
 
     params = nj.init(full)({}, obs, prevact, seed=0)
+    params = wake(params, 'rew/', 'future_rew/')
     _CACHE['state'] = (model, params, (obs, prevact))
   return _CACHE['state']
 
@@ -451,9 +477,9 @@ class TestLossesAndMetrics:
     ell, umask = np.asarray(ell, np.float64), np.asarray(umask, np.float64)
     want = (umask * ell).sum() / umask.sum()
     assert np.isclose(float(metrics['event_future_loss']), want, rtol=1e-4)
-    # And it is genuinely different from the unnormalized mean, so the test
-    # above cannot pass by accident.
-    assert not np.isclose(want, ell.mean(), rtol=1e-3)
+    # Dividing by B * T instead would scale the loss by the full-horizon
+    # fraction, which is what "independent of the valid fraction" rules out.
+    assert not np.isclose(want, (umask * ell).sum() / ell.size, rtol=1e-3)
 
   def test_an_empty_horizon_gives_an_exact_zero(self):
     """Every frame reset: no full-horizon window survives anywhere."""

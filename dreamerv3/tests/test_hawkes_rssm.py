@@ -835,10 +835,18 @@ class TestEventTypes:
   def test_summing_the_typed_channel_over_types_is_gradient_free(self):
     """sum_k (sg(y) c_k) is exactly sg(y), so a consumer that only sees the
     total typed mass trains nothing. This is why the two tests above weight
-    the channels, and why any future consumer must too."""
-    n = _grad_norms(
+    the channels, and why any future consumer must too.
+
+    Relative rather than exact: sum_k softmax_k is 1 only to float precision,
+    so the residual is float noise whose size depends on the classifier's
+    input width. Orders of magnitude below the weighted route is the claim.
+    """
+    total = _grad_norms(
         lambda los, feat: feat['haw_head_mix'][..., 1:].sum(), _is_type)
-    assert n == 0.0, n
+    weighted = _grad_norms(
+        lambda los, feat: _weighted(feat['haw_head_mix'][..., 1:]), _is_type)
+    assert total < 1e-5, total
+    assert total < 1e-2 * weighted, (total, weighted)
 
   def test_binary_head_channel_still_trains_the_detector(self):
     n = _grad_norms(
