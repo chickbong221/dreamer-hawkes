@@ -55,6 +55,14 @@ defaults:
       eval_max_episode_steps: 0  # 0 → reuse max_episode_steps; mshab overrides to 200
       frame_stack: 1             # mshab path: no FrameStack wrapper
       reward_mode: normalized_dense  # 'sparse' | 'dense' | 'normalized_dense'
+      # Forwarded to gym.make through the wrapper's **kwargs. SAPIEN's default
+      # shader allocates a full set of per-camera render targets (normals,
+      # albedo, position, segmentation); 'minimal' keeps only what the
+      # observation needs. At num_envs=128 with a 128^2 sensor camera and a
+      # 512^2 human render camera per env, the default shader exhausts GPU
+      # memory during camera-group creation. mshab already forced 'minimal'
+      # for itself; plain ManiSkill tasks were left on the default.
+      shader_dir: minimal
 
   replay:
     size: 5e6
